@@ -12,6 +12,7 @@ resources:
   - backend.yaml
   - whisperlive.yaml
   - libretranslate.yaml
+  - otel-collector.yaml
 images:
   - name: app
     newName: ghcr.io/quanaloha/curator

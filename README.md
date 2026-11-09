@@ -61,7 +61,25 @@ For optional Kubernetes components, credentials, jobs, databases, autoscaling, a
 
 ## Observability
 
-The API emits request instrumentation and application metrics; the worker emits spans for enhanced recording processing. Audio, transcript text, attendee contact details, and interest text are not added to telemetry attributes. Locally, the organizer view includes application-level operational readings. Configure an OTLP exporter in `.env` to inspect traces and metrics in Dash0. This prototype does not include a custom Dash0 dashboard or alert policies.
+Curator sends OpenTelemetry traces, metrics and logs to Dash0. Audio, transcript text, attendee contact details, interest text and search terms are never added to telemetry attributes or labels.
+
+**What is measured**
+
+| Signal | Name | Source |
+|---|---|---|
+| Request traces and HTTP metrics | FastAPI auto-instrumentation | API |
+| Translation latency (live and enhanced) | `conference.translation.duration` histogram, `translation.request` span | API, worker |
+| Live caption delay | `conference.transcript.delay` histogram (seconds from speech ending to caption arriving) | Browser, via `/api/telemetry/client-event` |
+| Client events | `conference.frontend.events` counter: `session_joined`, `transcript_delay`, `translation_unavailable`, `media_playback_error`, `websocket_disconnect` | Browser |
+| Enhanced processing | `recording.enhanced_processing` span with `extract_audio`, `transcribe`, `translate`, `store` child spans; `conference.processing.duration` histogram; `conference.processing.jobs` counter | Worker |
+| Operational gauges | `conference.active_viewers`, `conference.processing_jobs.queued`, backend CPU and memory | API |
+| Kubernetes containers | CPU, memory, network, restarts, readiness, requests and limits for `team-go-utah` | Cluster Prometheus, via the collector |
+
+**On the cluster**, the API and worker export to the in-cluster OpenTelemetry Collector ([`deploy/otel-collector.yaml`](deploy/otel-collector.yaml)), which forwards to Dash0. Only the collector reads the Dash0 credentials, from Secret `dash0-credentials` (keys `endpoint`, `auth-token`, `dataset`). Create that Secret in Radar's UI, never in git.
+
+**Locally**, set the `OTEL_EXPORTER_OTLP_*` values and set the exporters to `otlp` in `.env` to send directly to Dash0. With the exporters set to `none` (the default), telemetry is a no-op and the app works the same.
+
+This prototype does not include a custom Dash0 dashboard or alert policies yet.
 
 ## Prototype boundaries
 

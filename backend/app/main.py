@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -9,6 +10,7 @@ import psutil
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
 from . import db, observability
@@ -317,16 +319,28 @@ def translate_text(session_id: str, request: TranslationInput):
     session = _session_or_404(session_id)
     if request.target_language == session["source_language"]:
         return {"translated_text": request.text, "language": request.target_language}
-    try:
-        response = httpx.post(
-            f"{LIBRETRANSLATE_URL}/translate",
-            json={"q": request.text, "source": session["source_language"], "target": request.target_language, "format": "text"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        return {"translated_text": response.json()["translatedText"], "language": request.target_language}
-    except (httpx.HTTPError, KeyError, ValueError):
-        raise HTTPException(503, "Translation is temporarily unavailable. The original transcript is still available.")
+    attributes = {
+        "translation.source_language": session["source_language"],
+        "translation.target_language": request.target_language,
+        "translation.path": "live",
+    }
+    started = time.perf_counter()
+    with observability.tracer().start_as_current_span("translation.request", attributes=attributes) as span:
+        try:
+            response = httpx.post(
+                f"{LIBRETRANSLATE_URL}/translate",
+                json={"q": request.text, "source": session["source_language"], "target": request.target_language, "format": "text"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            translated = response.json()["translatedText"]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            span.set_status(Status(StatusCode.ERROR, exc.__class__.__name__))
+            observability.translation_duration().record(time.perf_counter() - started, {**attributes, "outcome": "error"})
+            observability.logger.warning("Live translation failed (%s) for target %s", exc.__class__.__name__, request.target_language)
+            raise HTTPException(503, "Translation is temporarily unavailable. The original transcript is still available.")
+    observability.translation_duration().record(time.perf_counter() - started, {**attributes, "outcome": "ok"})
+    return {"translated_text": translated, "language": request.target_language}
 
 
 @app.post("/api/sessions/{session_id}/viewers/heartbeat")
@@ -375,7 +389,8 @@ def enqueue_processing(session_id: str):
     )
     db.row("UPDATE sessions SET transcription_status = 'queued' WHERE id = %s RETURNING id", (session_id,))
     queued = db.row("SELECT count(*) AS total FROM processing_jobs WHERE status = 'queued'")["total"]
-    observability.set_operational_counts(0, queued)
+    # Only the queue changed; leave the active-viewer gauge as it is.
+    observability.set_operational_counts(queued_jobs=queued)
     return job
 
 
@@ -674,12 +689,28 @@ def review_speaker_edit(segment_id: int, edit: EditInput):
     return {"approved": True, "note": decision.get("note", "Reviewed by AI."), "transcript": updated}
 
 
+CLIENT_EVENTS = {
+    "session_joined", "transcript_delay", "translation_unavailable", "media_playback_error",
+    "websocket_reconnect", "websocket_disconnect",
+}
+
+
+class ClientEvent(BaseModel):
+    # Only an allowlisted event name, a coarse device category and, for
+    # transcript_delay, a number of seconds. No session content or identifiers.
+    name: str = Field(max_length=40)
+    device: str = Field(default="unknown", max_length=16)
+    value_seconds: float | None = Field(default=None, ge=0)
+
+
 @app.post("/api/telemetry/client-event")
-def record_client_event(payload: dict):
-    # This endpoint accepts only an allowlisted event name and coarse device category.
-    allowed = {"session_joined", "transcript_delay", "translation_unavailable", "media_playback_error", "websocket_reconnect"}
-    name = payload.get("name")
-    if name not in allowed:
+def record_client_event(event: ClientEvent):
+    if event.name not in CLIENT_EVENTS:
         raise HTTPException(400, "Unsupported client event")
-    observability.meter().create_counter("conference.frontend.events").add(1, {"event.name": name})
+    device = event.device if event.device in observability.DEVICE_CATEGORIES else "unknown"
+    attributes = {"event.name": event.name, "device.category": device}
+    observability.frontend_events().add(1, attributes)
+    if event.name == "transcript_delay" and event.value_seconds is not None:
+        delay = min(event.value_seconds, observability.MAX_CLIENT_DELAY_SECONDS)
+        observability.transcript_delay().record(delay, {"device.category": device})
     return {"accepted": True}
