@@ -6,6 +6,15 @@
 *.pem
 *.key
 
-node_modules/
-npm-debug.log*
+.env.*.local
+**/node_modules/
+**/dist/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
 .DS_Store
+npm-debug.log*
+
+# Local application data and recordings.
+data/
+recordings/

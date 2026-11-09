@@ -1,8 +1,13 @@
-# Kept out of the image build context.
+# Keep repository metadata, local dependencies, caches, and credentials out
+# of Docker build contexts. The production image only needs app/.
 .git
-**/node_modules
+**/node_modules/
+**/dist/
+**/__pycache__/
+**/.pytest_cache/
 **/*kubeconfig*
 **/.env
 **/.env.*
+!.env.example
 **/*.pem
 **/*.key

@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: { app: postgres }
+  ports: [{ name: postgres, port: 5432, targetPort: 5432 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+spec:
+  selector: { app: elasticsearch }
+  ports: [{ name: http, port: 9200, targetPort: 9200 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisperlive
+spec:
+  selector: { app: whisperlive }
+  ports:
+    - { name: websocket, port: 9090, targetPort: 9090 }
+    - { name: rest, port: 8000, targetPort: 8000 }
+    - { name: metrics, port: 9091, targetPort: 9091 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: libretranslate
+spec:
+  selector: { app: libretranslate }
+  ports: [{ name: http, port: 5000, targetPort: 5000 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: conference-api
+spec:
+  selector: { app: conference-api }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: conference-frontend
+spec:
+  selector: { app: conference-frontend }
+  ports: [{ name: http, port: 80, targetPort: 80 }]

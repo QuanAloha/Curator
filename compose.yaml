@@ -1,0 +1,147 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-conference}:${POSTGRES_PASSWORD:-conference_dev_password}@postgres:5432/${POSTGRES_DB:-conference}
+      WHISPERLIVE_REST_URL: http://whisperlive:8000
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-astra}
+      MEDIA_ROOT: /data/recordings
+      OTEL_SERVICE_NAME: conference-companion-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-none}
+      ENHANCED_WHISPER_MODEL: ${ENHANCED_WHISPER_MODEL:-small}
+      MAX_MEDIA_BYTES: ${MAX_MEDIA_BYTES:-1073741824}
+    volumes:
+      - recordings:/data/recordings
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      whisperlive:
+        condition: service_started
+      libretranslate:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+    command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-conference}:${POSTGRES_PASSWORD:-conference_dev_password}@postgres:5432/${POSTGRES_DB:-conference}
+      WHISPERLIVE_REST_URL: http://whisperlive:8000
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      MEDIA_ROOT: /data/recordings
+      ENHANCED_WHISPER_MODEL: ${ENHANCED_WHISPER_MODEL:-small}
+      OTEL_SERVICE_NAME: conference-companion-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-none}
+    volumes:
+      - recordings:/data/recordings
+    depends_on:
+      postgres:
+        condition: service_healthy
+      whisperlive:
+        condition: service_started
+      libretranslate:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-conference}
+      POSTGRES_USER: ${POSTGRES_USER:-conference}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conference_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conference} -d ${POSTGRES_DB:-conference}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  whisperlive:
+    # Upstream publishes this CPU image for AMD64; Docker Desktop emulates it on ARM Macs.
+    image: ghcr.io/collabora/whisperlive-cpu:latest
+    platform: linux/amd64
+    command: ["python", "run_server.py", "--port", "9090", "--backend", "faster_whisper", "--enable_rest", "--rest_port", "8000", "--metrics_port", "9091", "--default_model", "small", "--cors-origins", "http://localhost:3000,http://127.0.0.1:3000"]
+    ports:
+      - "${WHISPERLIVE_PORT:-9090}:9090"
+    expose:
+      - "8000"
+      - "9091"
+    volumes:
+      - whisperlive_cache:/root/.cache/whisper-live
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    ports:
+      - "${LIBRETRANSLATE_PORT:-5001}:5000"
+    volumes:
+      - libretranslate_models:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "./venv/bin/python scripts/healthcheck.py"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  whisperlive_cache:
+  libretranslate_models:
+  elasticsearch_data:
+  recordings:
