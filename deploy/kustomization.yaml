@@ -10,5 +10,5 @@ resources:
   - httproute.yaml
 images:
   - name: app
-    newName: ghcr.io/OWNER/REPO
-    newTag: latest
+    newName: ghcr.io/quanaloha/curator
+    newTag: 9bc2400
