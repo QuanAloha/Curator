@@ -1,0 +1,228 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_DB
+              value: conference
+            - name: POSTGRES_USER
+              value: conference
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: POSTGRES_PASSWORD }
+          ports: [{ name: postgres, containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U conference -d conference"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: postgres-data }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: elasticsearch }
+  template:
+    metadata:
+      labels: { app: elasticsearch }
+    spec:
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+          env:
+            - { name: discovery.type, value: single-node }
+            - { name: xpack.security.enabled, value: "false" }
+            - { name: ES_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
+          ports: [{ name: http, containerPort: 9200 }]
+          volumeMounts: [{ name: data, mountPath: /usr/share/elasticsearch/data }]
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /_cluster/health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: elasticsearch-data }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisperlive
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: whisperlive }
+  template:
+    metadata:
+      labels: { app: whisperlive }
+    spec:
+      containers:
+        - name: whisperlive
+          image: ghcr.io/collabora/whisperlive-cpu:latest
+          command: ["python", "run_server.py"]
+          args: ["--port", "9090", "--backend", "faster_whisper", "--enable_rest", "--rest_port", "8000", "--metrics_port", "9091", "--default_model", "small"]
+          ports:
+            - { name: websocket, containerPort: 9090 }
+            - { name: rest, containerPort: 8000 }
+            - { name: metrics, containerPort: 9091 }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "4", memory: 6Gi }
+          readinessProbe:
+            httpGet: { path: /health, port: rest }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libretranslate
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: libretranslate }
+  template:
+    metadata:
+      labels: { app: libretranslate }
+    spec:
+      containers:
+        - name: libretranslate
+          image: libretranslate/libretranslate:latest
+          ports: [{ name: http, containerPort: 5000 }]
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /languages, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conference-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: conference-api }
+  template:
+    metadata:
+      labels: { app: conference-api }
+    spec:
+      containers:
+        - name: api
+          image: conference-companion-backend:latest
+          ports: [{ name: http, containerPort: 8000 }]
+          envFrom:
+            - configMapRef: { name: conference-config }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: DATABASE_URL }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: OPENAI_API_KEY, optional: true }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: OTEL_EXPORTER_OTLP_ENDPOINT, optional: true }
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: OTEL_EXPORTER_OTLP_HEADERS, optional: true }
+            - { name: OTEL_SERVICE_NAME, value: conference-companion-api }
+          volumeMounts: [{ name: recordings, mountPath: /data/recordings }]
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: recordings
+          persistentVolumeClaim: { claimName: conference-recordings }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conference-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: conference-worker }
+  template:
+    metadata:
+      labels: { app: conference-worker }
+    spec:
+      containers:
+        - name: worker
+          image: conference-companion-backend:latest
+          command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+          envFrom:
+            - configMapRef: { name: conference-config }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: DATABASE_URL }
+            - name: OTEL_SERVICE_NAME
+              value: conference-companion-worker
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: OTEL_EXPORTER_OTLP_ENDPOINT, optional: true }
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef: { name: conference-secrets, key: OTEL_EXPORTER_OTLP_HEADERS, optional: true }
+          volumeMounts: [{ name: recordings, mountPath: /data/recordings }]
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: recordings
+          persistentVolumeClaim: { claimName: conference-recordings }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conference-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: conference-frontend }
+  template:
+    metadata:
+      labels: { app: conference-frontend }
+    spec:
+      containers:
+        - name: frontend
+          image: conference-companion-frontend:latest
+          ports: [{ name: http, containerPort: 80 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10

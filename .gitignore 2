@@ -1,0 +1,10 @@
+.env
+.env.*.local
+node_modules/
+frontend/dist/
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+data/
+recordings/
