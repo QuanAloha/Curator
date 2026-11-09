@@ -38,9 +38,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      # Both images go to the same (public) GHCR package under different tags:
+      # <sha> is the frontend, <sha>-backend is the API/worker.
+      - name: Build and push the frontend
+        uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./frontend
           push: true
           build-args: APP_VERSION=${{ steps.meta.outputs.tag }}
           tags: |
@@ -48,7 +51,17 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: Point the manifests at the new image
+      - name: Build and push the backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}-backend
+            ${{ steps.meta.outputs.image }}:latest-backend
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Point the manifests at the new images
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAG: ${{ steps.meta.outputs.tag }}
@@ -62,6 +75,7 @@ jobs:
             git fetch -q origin main
             git reset -q --hard FETCH_HEAD
             yq -i '(.images[] | select(.name == "app")) |= (.newName = strenv(IMAGE) | .newTag = strenv(TAG))' deploy/kustomization.yaml
+            yq -i '(.images[] | select(.name == "backend")) |= (.newName = strenv(IMAGE) | .newTag = strenv(TAG) + "-backend")' deploy/kustomization.yaml
             if git diff --quiet; then exit 0; fi
             git commit -qam "deploy: ${TAG} [skip ci]"
             if git push -q origin HEAD:main; then exit 0; fi

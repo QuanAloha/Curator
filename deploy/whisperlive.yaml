@@ -1,0 +1,87 @@
+# WhisperLive speech-to-text (CPU build). Sized down to fit the team budget:
+# live transcription with the "small" model on ~1 CPU is slower than on a laptop.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisperlive
+  labels:
+    app: whisperlive
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisperlive
+  template:
+    metadata:
+      labels:
+        app: whisperlive
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: whisperlive
+          image: ghcr.io/collabora/whisperlive-cpu:latest
+          command: ["python", "run_server.py"]
+          args:
+            - --port
+            - "9090"
+            - --backend
+            - faster_whisper
+            - --enable_rest
+            - --rest_port
+            - "8000"
+            - --metrics_port
+            - "9091"
+            - --default_model
+            - small
+            - --cors-origins
+            - https://go-utah.cnh.radarhq.io
+          ports:
+            - name: websocket
+              containerPort: 9090
+            - name: rest
+              containerPort: 8000
+            - name: metrics
+              containerPort: 9091
+          volumeMounts:
+            - name: cache
+              mountPath: /root/.cache
+          resources:
+            requests:
+              cpu: 300m
+              memory: 1Gi
+            limits:
+              cpu: 1200m
+              memory: 3Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: rest
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        # Model downloads; re-fetched if the pod moves.
+        - name: cache
+          emptyDir:
+            sizeLimit: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisperlive
+  labels:
+    app: whisperlive
+spec:
+  selector:
+    app: whisperlive
+  ports:
+    - name: websocket
+      port: 9090
+      targetPort: websocket
+    - name: rest
+      port: 8000
+      targetPort: rest
