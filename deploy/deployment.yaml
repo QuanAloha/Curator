@@ -1,3 +1,7 @@
+# Curator frontend (React + nginx). It keeps the name "app" because the
+# platform routes https://go-utah.cnh.radarhq.io to Service app, port 80.
+# nginx serves the UI and proxies /api/ to Service backend and /ws/whisper
+# to Service whisperlive.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,30 +20,28 @@ spec:
       labels:
         app: app
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: app
           image: app
           ports:
             - name: http
               containerPort: 8080
-          env:
-            - name: TEAM_NAME
-              value: "go-utah"
           resources:
             requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
               cpu: 100m
               memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /version.txt
               port: http
             periodSeconds: 5
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /version.txt
               port: http
             periodSeconds: 10
           securityContext:

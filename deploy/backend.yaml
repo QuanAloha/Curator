@@ -1,0 +1,151 @@
+# Curator API and its recording-processing worker, in one pod so they can
+# share the recordings volume (a gp3 disk attaches to one node at a time).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: recordings
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+data:
+  WHISPERLIVE_REST_URL: http://whisperlive:8000
+  LIBRETRANSLATE_URL: http://libretranslate:5000
+  # Elasticsearch is left out to stay inside the team budget; search falls
+  # back to Postgres when this is empty.
+  ELASTICSEARCH_URL: ""
+  MEDIA_ROOT: /data/recordings
+  OPENAI_MODEL: gpt-6-astra
+  ENHANCED_WHISPER_MODEL: small
+  MAX_MEDIA_BYTES: "1073741824"
+  OTEL_TRACES_EXPORTER: none
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  # The recordings volume can't attach to two pods on different nodes, so
+  # stop the old pod before starting the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: api
+          image: backend
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: conference-companion-api
+            # Made by the CloudNativePG operator for Cluster db (deploy/postgres.yaml).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-app
+                  key: uri
+            # Optional. Create Secret app-credentials outside git to turn on AI features
+            # (examples/agent-workflows/README.md).
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-credentials
+                  key: openai-api-key
+                  optional: true
+          volumeMounts:
+            - name: recordings
+              mountPath: /data/recordings
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+        - name: worker
+          image: backend
+          command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: conference-companion-worker
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-app
+                  key: uri
+          volumeMounts:
+            - name: recordings
+              mountPath: /data/recordings
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 400m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: recordings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

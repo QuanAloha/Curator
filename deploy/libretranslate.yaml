@@ -1,0 +1,67 @@
+# LibreTranslate, loading only the languages Curator supports (en, es, tl)
+# to keep memory and start-up time down. Models download on first start.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libretranslate
+  labels:
+    app: libretranslate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: libretranslate
+  template:
+    metadata:
+      labels:
+        app: libretranslate
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: libretranslate
+          image: libretranslate/libretranslate:latest
+          env:
+            - name: LT_LOAD_ONLY
+              value: en,es,tl
+          ports:
+            - name: http
+              containerPort: 5000
+          volumeMounts:
+            - name: models
+              mountPath: /home/libretranslate/.local
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 600m
+              memory: 1536Mi
+          readinessProbe:
+            httpGet:
+              path: /languages
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: models
+          emptyDir:
+            sizeLimit: 3Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: libretranslate
+  labels:
+    app: libretranslate
+spec:
+  selector:
+    app: libretranslate
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
