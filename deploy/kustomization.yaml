@@ -11,4 +11,4 @@ resources:
 images:
   - name: app
     newName: ghcr.io/quanaloha/curator
-    newTag: 9bc2400
+    newTag: 6207b78
