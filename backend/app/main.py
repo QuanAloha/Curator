@@ -1,7 +1,9 @@
 import os
 import re
 import time
+import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +55,8 @@ class TranslationInput(BaseModel):
 class SearchInput(BaseModel):
     session_id: str
     query: str = Field(min_length=1, max_length=160)
+    # The language the attendee is reading; results are shown in it when a translation exists.
+    language: Literal["en", "es", "tl"] | None = None
 
 
 class SessionUpdate(BaseModel):
@@ -558,31 +562,141 @@ def get_feedback(session_id: str):
     return db.rows("SELECT rating, count FROM feedback_counts WHERE session_id = %s ORDER BY rating", (session_id,))
 
 
+# Accent folding done in SQL, matching _fold() below, so "informacion" finds "información"
+# whatever the database locale. Upper-case letters are listed too because lower() only
+# folds ASCII under the C locale.
+_ACCENTED = "áàâäãåéèêëíìîïóòôöõúùûüñç"
+_ACCENTED += _ACCENTED.upper()
+_UNACCENTED = "aaaaaaeeeeiiiiooooouuuunc" * 2
+assert len(_ACCENTED) == len(_UNACCENTED)
+_FOLDED_TEXT_SQL = f"translate(lower(text), '{_ACCENTED}', '{_UNACCENTED}')"
+_SEARCH_STOPWORDS = {
+    "the", "and", "of", "to", "in", "on", "for", "is", "it",  # en
+    "el", "la", "los", "las", "de", "del", "y", "en", "un", "una", "que", "por", "con",  # es
+    "ang", "ng", "sa", "mga", "na", "at", "ay", "si",  # tl
+}
+
+
+def _fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _search_terms(text: str) -> list[str]:
+    words = [word for word in re.findall(r"\w+", _fold(text)) if len(word) >= 2]
+    keywords = [word for word in words if word not in _SEARCH_STOPWORDS] or words
+    return list(dict.fromkeys(keywords))[:6]
+
+
+def _translate_query(query: str, target: str) -> str:
+    """Best-effort query translation; search still works on the typed words if this fails."""
+    try:
+        response = httpx.post(
+            f"{LIBRETRANSLATE_URL}/translate",
+            json={"q": query, "source": "auto", "target": target, "format": "text"},
+            timeout=2,
+        )
+        response.raise_for_status()
+        return response.json()["translatedText"]
+    except (httpx.HTTPError, KeyError, ValueError):
+        return ""
+
+
+def _query_variants(query: str) -> list[list[str]]:
+    """The typed keywords plus their translation into each transcript language."""
+    targets = sorted(SUPPORTED_LANGUAGES)
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        translations = list(pool.map(lambda target: _translate_query(query, target), targets))
+    variants: list[list[str]] = []
+    for text in [query, *translations]:
+        terms = _search_terms(text)
+        if terms and terms not in variants:
+            variants.append(terms)
+    return variants
+
+
+def _elasticsearch_matches(session_id: str, variants: list[list[str]]) -> list[dict]:
+    if not ELASTICSEARCH_URL:
+        return []
+    should = [
+        {"match": {"text": {"query": " ".join(terms), "operator": "and", "fuzziness": "AUTO:4,8", "prefix_length": 1}}}
+        for terms in variants
+    ]
+    try:
+        response = httpx.post(
+            f"{ELASTICSEARCH_URL}/conference-transcripts/_search",
+            json={"size": 100, "query": {"bool": {"should": should, "minimum_should_match": 1, "filter": [{"term": {"session_id.keyword": session_id}}]}}},
+            timeout=2,
+        )
+        response.raise_for_status()
+        return [{"id": int(hit["_id"]), **hit["_source"]} for hit in response.json()["hits"]["hits"]]
+    except (httpx.HTTPError, KeyError, ValueError, TypeError):
+        return []
+
+
+def _postgres_matches(session_id: str, variants: list[list[str]]) -> list[dict]:
+    # Every keyword of a variant must start a word in the segment (accent- and case-insensitive).
+    clauses, params = [], [session_id]
+    for terms in variants:
+        clauses.append("(" + " AND ".join(f"{_FOLDED_TEXT_SQL} ~ %s" for _ in terms) + ")")
+        params.extend(rf"\m{term}" for term in terms)
+    return db.rows(
+        f"""SELECT id, session_id, start_seconds, end_seconds, language, text
+            FROM transcript_segments WHERE session_id = %s AND ({" OR ".join(clauses)})
+            ORDER BY start_seconds LIMIT 200""",
+        tuple(params),
+    )
+
+
 @app.post("/api/search")
 def search(request: SearchInput):
+    """Search every language of a talk's transcript and show each hit in the reader's language."""
     session = _session_or_404(request.session_id)
     if not session["publish_content"]:
         raise HTTPException(403, "This session is not published for attendee search.")
-    query = request.query.strip()
-    if ELASTICSEARCH_URL:
-        try:
-            response = httpx.post(
-                f"{ELASTICSEARCH_URL}/conference-transcripts/_search",
-                json={"size": 30, "query": {"bool": {"must": [{"match": {"text": query}}], "filter": [{"term": {"session_id.keyword": request.session_id}}]}}},
-                timeout=2,
-            )
-            response.raise_for_status()
-            hits = response.json()["hits"]["hits"]
-            if hits:
-                return [{"id": hit["_id"], **hit["_source"]} for hit in hits]
-        except (httpx.HTTPError, KeyError, ValueError):
-            pass
-    return db.rows(
-        """SELECT id, session_id, start_seconds, end_seconds, language, text
-           FROM transcript_segments WHERE session_id = %s AND language = %s AND text ILIKE %s
-           ORDER BY start_seconds LIMIT 30""",
-        (request.session_id, session["source_language"], f"%{query}%"),
-    )
+    variants = _query_variants(request.query.strip())
+    if not variants:
+        return []
+    source = session["source_language"]
+    display_language = request.language or source
+
+    def preference(segment: dict) -> int:
+        return 0 if segment["language"] == display_language else 1 if segment["language"] == source else 2
+
+    # One hit per moment in the talk: segments in different languages share a start time.
+    best: dict[float, dict] = {}
+    for match in _elasticsearch_matches(request.session_id, variants) + _postgres_matches(request.session_id, variants):
+        moment = round(float(match["start_seconds"]), 2)
+        if moment not in best or preference(match) < preference(best[moment]):
+            best[moment] = match
+    if not best:
+        return []
+
+    shown_lines = {
+        round(float(line["start_seconds"]), 2): line
+        for line in db.rows(
+            """SELECT id, session_id, start_seconds, end_seconds, language, text
+               FROM transcript_segments WHERE session_id = %s AND language = %s""",
+            (request.session_id, display_language),
+        )
+    }
+    match_terms = sorted({term for terms in variants for term in terms}, key=len, reverse=True)
+    results = []
+    for moment in sorted(best)[:30]:
+        match = best[moment]
+        shown = shown_lines.get(moment, match)
+        results.append({
+            "id": shown["id"],
+            "session_id": request.session_id,
+            "start_seconds": shown["start_seconds"],
+            "end_seconds": shown["end_seconds"],
+            "language": shown["language"],
+            "text": shown["text"],
+            "matched_language": match["language"],
+            "matched_text": match["text"],
+            "match_terms": match_terms,
+        })
+    return results
 
 
 def _openai_text(instructions: str, prompt: str):

@@ -84,7 +84,12 @@ p { margin: 0; }
   background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
-.wordmark { font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: -0.01em; }
+/* Logo lockup: mark height ≈ 0.8 × cap height, gap ≈ 0.7 × cap height (from the brand artwork) */
+.brand { display: inline-flex; align-items: center; gap: 11px; color: var(--text); }
+.brand-mark { display: block; flex: none; width: 28px; height: 12px; }
+.brand-ink { fill: var(--text); }
+.brand-accent { fill: var(--accent); }
+.wordmark { font-family: var(--display); font-weight: 700; font-size: 22px; line-height: 1; letter-spacing: -0.01em; }
 .header-controls { display: flex; align-items: center; gap: 16px; }
 
 /* Segmented toggle (language, view) */
@@ -133,7 +138,7 @@ p { margin: 0; }
 /* View switcher under the header */
 .view-bar { width: 100%; max-width: 880px; margin: 0 auto; padding: 12px var(--gutter) 0; }
 .seg-fill { display: flex; }
-.seg-fill button { flex: 1; min-height: 40px; text-transform: capitalize; }
+.seg-fill button { flex: 1; min-width: 0; min-height: 40px; padding: 6px 4px; }
 
 /* ---------- Page containers ---------- */
 .curator, .page {
@@ -262,6 +267,9 @@ button.ts:hover { color: var(--text); text-decoration: underline; text-decoratio
 
 /* Search matches */
 mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1px; }
+.lang-tag { margin-right: 8px; font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--muted); vertical-align: 0.15em; }
+.match-note { margin-top: 4px; font-size: 14px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
+.match-note .lang-tag { vertical-align: 0; }
 
 /* Outage: a translation failure is a line in the feed, in the accent */
 .outage-line .line-text { color: var(--accent); font-weight: 600; }
@@ -372,14 +380,18 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
   background: var(--bg);
   cursor: pointer;
 }
+.upload-drop { position: relative; }
 .upload-drop small { color: var(--muted); font-size: 13px; }
-.upload-drop input { max-width: 100%; margin-top: 6px; font-size: 14px; color: var(--muted); }
-.upload-drop input::file-selector-button {
-  margin-right: 12px; padding: 8px 14px;
+.upload-drop:has(.file-input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 6px; }
+.file-button {
+  padding: 8px 14px;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--surface); color: var(--text);
-  font: 600 14px var(--sans); cursor: pointer;
+  font-size: 14px; font-weight: 600;
 }
+.file-name { min-width: 0; font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
 
 /* Rows (sessions, queue, polls, ratings, services) */
 .row-list { display: flex; flex-direction: column; }
@@ -474,10 +486,15 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
   .session-facts { display: none; } /* keep the bar to the two actions on small screens */
   .control-bar .btn-primary { flex: 1; }
   .header-controls { gap: 10px; }
+  /* Phones: the status keeps its dot; the word stays available to screen readers. */
+  .live-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 }
 @media (max-width: 380px) {
   .seg-toggle button { padding: 6px 9px; }
-  .live-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .seg-fill button { padding: 6px 2px; font-size: 11px; }
+  .brand { gap: 8px; }
+  .brand-mark { width: 23px; height: 10px; }
+  .wordmark { font-size: 19px; }
 }
 
 /* ---------- Motion: respect reduced-motion ---------- */

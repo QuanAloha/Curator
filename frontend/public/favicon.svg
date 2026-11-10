@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    .ink { fill: #1C1917; } .accent { fill: #8C1D2F; }
+    @media (prefers-color-scheme: dark) { .ink { fill: #FAFAF9; } .accent { fill: #D64550; } }
+  </style>
+  <!-- Curator mark (261 x 115) scaled to 60 wide and centred -->
+  <rect class="ink" x="2" y="18.8" width="60" height="9.2" rx="4.6"/>
+  <rect class="accent" x="2" y="36" width="43.9" height="9.2" rx="4.6"/>
+</svg>

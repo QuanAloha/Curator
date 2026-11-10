@@ -16,7 +16,7 @@ resources:
 images:
   - name: app
     newName: ghcr.io/quanaloha/curator
-    newTag: b9f39aa
+    newTag: a830d72
   - name: backend
     newName: ghcr.io/quanaloha/curator
-    newTag: b9f39aa-backend
+    newTag: a830d72-backend
