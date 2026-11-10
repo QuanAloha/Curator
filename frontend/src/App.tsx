@@ -1,7 +1,6 @@
-import { Fragment, FormEvent, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { Fragment, FormEvent, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
+import { I18n, STRINGS, statusLabel, useT, type Language, type Role, type Strings } from './i18n';
 
-type Role = 'attendee' | 'speaker' | 'organizer';
-type Language = 'en' | 'es' | 'tl';
 type Theme = 'dark' | 'light';
 type LiveState = 'idle' | 'connecting' | 'live';
 type Session = {
@@ -15,6 +14,11 @@ type Session = {
 type Segment = {
   id: number; start_seconds: number; end_seconds: number; language: Language;
   text: string; source: string; edited_by_speaker: boolean; edit_review_status: string;
+};
+/** A search hit shown in the reader's language; `matched_*` is the line whose words actually matched. */
+type SearchHit = {
+  id: number; start_seconds: number; end_seconds: number; language: Language; text: string;
+  matched_language?: Language; matched_text?: string; match_terms?: string[];
 };
 type Job = { id: string; status: string; progress: number; priority?: number; message: string; created_at: string; finished_at?: string };
 type Poll = { id: string; question: string; kind: string; active: boolean; total_votes: number; options: { id: number; label: string; votes: number }[] };
@@ -48,22 +52,25 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-const LANGUAGES: Record<Language, string> = { en: 'English', es: 'Spanish', tl: 'Tagalog' };
-const LANGUAGE_CODES = Object.keys(LANGUAGES) as Language[];
+const LANGUAGE_CODES: Language[] = ['en', 'es', 'tl'];
 const ROLES: Role[] = ['attendee', 'speaker', 'organizer'];
 const THEME_KEY = 'curator-theme';
-const JOB_LABELS: Record<string, string> = {
-  queued: 'Enhanced transcript queued',
-  processing: 'Enhanced transcript processing',
-  completed: 'Enhanced transcript ready',
-  failed: 'Enhanced transcript needs attention',
-};
-const formatTime = (value?: string) => value ? new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'Time TBA';
+const LANGUAGE_KEY = 'curator-language';
 const formatTimestamp = (seconds: number) => `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`;
+const formatTime = (t: Strings, value?: string) => value ? new Date(value).toLocaleTimeString(t.locale, { hour: 'numeric', minute: '2-digit' }) : t.timeTba;
+const formatNumber = (t: Strings, value: number) => value.toLocaleString(t.locale);
+const jobLabel = (t: Strings, status: string) => t.jobLabels[status] ?? statusLabel(t, status);
 const errorText = (reason: unknown, fallback: string) => reason instanceof Error ? reason.message : fallback;
 
-function readTheme(): Theme {
-  try { return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
+function readSetting<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const saved = localStorage.getItem(key);
+    return allowed.find((value) => value === saved) ?? fallback;
+  } catch { return fallback; }
+}
+
+function saveSetting(key: string, value: string) {
+  try { localStorage.setItem(key, value); } catch { /* private browsing: the setting lasts for this visit only */ }
 }
 
 function statusClass(status: string) {
@@ -75,7 +82,8 @@ function statusClass(status: string) {
 
 export default function App() {
   const [role, setRole] = useState<Role>('attendee');
-  const [theme, setTheme] = useState<Theme>(readTheme);
+  const [theme, setTheme] = useState<Theme>(() => readSetting(THEME_KEY, ['dark', 'light'], 'dark'));
+  const [language, setLanguage] = useState<Language>(() => readSetting(LANGUAGE_KEY, LANGUAGE_CODES, 'en'));
   const [liveState, setLiveState] = useState<LiveState>('idle');
   const [event, setEvent] = useState<ConferenceEvent | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -84,10 +92,12 @@ export default function App() {
   const [error, setError] = useState('');
   const [overview, setOverview] = useState<Overview | null>(null);
   const [transcript, setTranscript] = useState<Segment[]>([]);
-  const [language, setLanguage] = useState<Language>('en');
   const [jobs, setJobs] = useState<Job[]>([]);
   const [polls, setPolls] = useState<Poll[]>([]);
   const [interests, setInterests] = useState<{ topic: string; count: number }[]>([]);
+  const t = STRINGS[language];
+  const tRef = useRef(t);
+  tRef.current = t;
   const session = sessions.find((item) => item.id === selectedId) ?? sessions[0];
 
   const loadSessions = useCallback(async () => {
@@ -101,7 +111,7 @@ export default function App() {
       setSelectedId((current) => current || nextSessions[0]?.id || '');
       setError('');
     } catch (reason) {
-      setError(errorText(reason, 'Could not connect to the conference service.'));
+      setError(errorText(reason, tRef.current.connectError));
     }
   }, []);
 
@@ -116,8 +126,12 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0C0A09' : '#FAF9F7');
-    try { localStorage.setItem(THEME_KEY, theme); } catch { /* private browsing: the theme lasts for this visit only */ }
+    saveSetting(THEME_KEY, theme);
   }, [theme]);
+  useEffect(() => {
+    document.documentElement.lang = language;
+    saveSetting(LANGUAGE_KEY, language);
+  }, [language]);
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => {
     const timer = window.setInterval(() => void loadSessions(), 10000);
@@ -141,7 +155,7 @@ export default function App() {
         ]);
         if (alive) { setTranscript(segments); setJobs(nextJobs); setPolls(nextPolls); }
       } catch (reason) {
-        if (alive) setError(errorText(reason, 'Could not load session data.'));
+        if (alive) setError(errorText(reason, tRef.current.loadError));
       }
     };
     void refresh();
@@ -171,43 +185,55 @@ export default function App() {
     window.setTimeout(() => setNotice(''), 5000);
   };
 
-  const liveLabel = liveState === 'live' ? 'LIVE' : liveState === 'connecting' ? 'STARTING' : 'IDLE';
-
   return (
-    <div className="app-shell">
-      <header className="curator-header">
-        <div className="wordmark">Curator</div>
-        <div className="header-controls">
-          {role === 'attendee' && <div className="seg-toggle" role="group" aria-label="Transcript language">
-            {LANGUAGE_CODES.map((code) => <button key={code} type="button" className={language === code ? 'active' : ''} aria-pressed={language === code} title={LANGUAGES[code]} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}
-          </div>}
-          <button type="button" className="theme-toggle" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? '☀' : '☾'}</button>
-          {role === 'attendee' && <span className={`live-status${liveState === 'live' ? ' on' : ''}`} role="status"><span className="dot" /><span className="live-label">{liveLabel}</span></span>}
-        </div>
-      </header>
+    <I18n.Provider value={t}>
+      <div className="app-shell">
+        <header className="curator-header">
+          <Logo />
+          <div className="header-controls">
+            <div className="seg-toggle" role="group" aria-label={t.languageToggle}>
+              {LANGUAGE_CODES.map((code) => <button key={code} type="button" lang={code} className={language === code ? 'active' : ''} aria-pressed={language === code} title={STRINGS[code].languageNames[code]} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}
+            </div>
+            <button type="button" className="theme-toggle" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? t.themeToLight : t.themeToDark}>{theme === 'dark' ? '☀' : '☾'}</button>
+            {role === 'attendee' && <span className={`live-status${liveState === 'live' ? ' on' : ''}`} role="status"><span className="dot" /><span className="live-label">{t.liveStatus[liveState]}</span></span>}
+          </div>
+        </header>
 
-      <nav className="view-bar" aria-label="Choose view">
-        <div className="seg-toggle seg-fill">
-          {ROLES.map((item) => <button key={item} type="button" className={role === item ? 'active' : ''} aria-pressed={role === item} onClick={() => setRole(item)}>{item}</button>)}
-        </div>
-      </nav>
+        <nav className="view-bar" aria-label={t.chooseView}>
+          <div className="seg-toggle seg-fill">
+            {ROLES.map((item) => <button key={item} type="button" className={role === item ? 'active' : ''} aria-pressed={role === item} onClick={() => setRole(item)}>{t.roles[item]}</button>)}
+          </div>
+        </nav>
 
-      {(notice || error) && <div className={`notice${error ? ' notice-error' : ''}`} role="status"><span>{error || notice}</span><button type="button" onClick={() => { setError(''); setNotice(''); }} aria-label="Dismiss">×</button></div>}
+        {(notice || error) && <div className={`notice${error ? ' notice-error' : ''}`} role="status"><span>{error || notice}</span><button type="button" onClick={() => { setError(''); setNotice(''); }} aria-label={t.dismiss}>×</button></div>}
 
-      {error && !sessions.length ? <main className="empty-state"><h1>Can’t reach the conference service</h1><p>{error}</p><button type="button" className="btn-primary" onClick={() => void loadSessions()}>Try again</button></main> : <>
-        {role !== 'organizer' && !session && <main className="empty-state"><p>{event ? 'No sessions yet.' : 'Loading sessions…'}</p></main>}
-        {role === 'attendee' && session && <AttendeeView key={session.id} session={session} sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} language={language} transcript={transcript} setTranscript={setTranscript} jobs={jobs} polls={polls} liveState={liveState} setLiveState={setLiveState} onMessage={flash} />}
-        {role === 'speaker' && session && <SpeakerView key={session.id} session={session} sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} transcript={transcript} jobs={jobs} polls={polls} onMessage={flash} onRefresh={loadSessions} />}
-        {role === 'organizer' && event && <OrganizerView event={event} overview={overview} interests={interests} onRefresh={loadOverview} onMessage={flash} />}
-      </>}
+        {error && !sessions.length ? <main className="empty-state"><h1>{t.cantReach}</h1><p>{error}</p><button type="button" className="btn-primary" onClick={() => void loadSessions()}>{t.tryAgain}</button></main> : <>
+          {role !== 'organizer' && !session && <main className="empty-state"><p>{event ? t.noSessions : t.loadingSessions}</p></main>}
+          {role === 'attendee' && session && <AttendeeView key={session.id} session={session} sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} language={language} transcript={transcript} setTranscript={setTranscript} jobs={jobs} polls={polls} liveState={liveState} setLiveState={setLiveState} onMessage={flash} />}
+          {role === 'speaker' && session && <SpeakerView key={session.id} session={session} sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} transcript={transcript} jobs={jobs} polls={polls} onMessage={flash} onRefresh={loadSessions} />}
+          {role === 'organizer' && event && <OrganizerView event={event} overview={overview} interests={interests} onRefresh={loadOverview} onMessage={flash} />}
+        </>}
 
-      <footer className="app-footer"><span>CURATOR · PROTOTYPE</span><a href="/api/health" target="_blank" rel="noreferrer">Service health ↗</a></footer>
-    </div>
+        <footer className="app-footer"><span>{t.footer}</span><a href="/api/health" target="_blank" rel="noreferrer">{t.serviceHealth}</a></footer>
+      </div>
+    </I18n.Provider>
   );
 }
 
+/** Curator lockup. The bars use theme tokens, so one mark serves light and dark. Geometry from the brand artwork. */
+function Logo() {
+  return <div className="brand" role="img" aria-label="Curator">
+    <svg className="brand-mark" viewBox="0 0 261 115" aria-hidden="true" focusable="false">
+      <rect className="brand-ink" width="261" height="40" rx="20" />
+      <rect className="brand-accent" y="75" width="191" height="40" rx="20" />
+    </svg>
+    <span className="wordmark" aria-hidden="true">Curator</span>
+  </div>;
+}
+
 function SessionSelect({ sessions, selectedId, onChange }: { sessions: Session[]; selectedId: string; onChange: (id: string) => void }) {
-  return <select className="session-select" value={selectedId} onChange={(event) => onChange(event.target.value)} aria-label="Choose a session">
+  const t = useT();
+  return <select className="session-select" value={selectedId} onChange={(event) => onChange(event.target.value)} aria-label={t.chooseSession}>
     {sessions.map((session) => <option value={session.id} key={session.id}>{session.title}</option>)}
   </select>;
 }
@@ -231,6 +257,7 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
   transcript: Segment[]; setTranscript: Dispatch<SetStateAction<Segment[]>>; jobs: Job[]; polls: Poll[];
   liveState: LiveState; setLiveState: (state: LiveState) => void; onMessage: Notify;
 }) {
+  const t = useT();
   const videoRef = useRef<HTMLVideoElement>(null);
   const feedRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -245,7 +272,7 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
   const [outages, setOutages] = useState<Outage[]>([]);
   const [currentTime, setCurrentTime] = useState(0);
   const [search, setSearch] = useState('');
-  const [results, setResults] = useState<Segment[] | null>(null);
+  const [results, setResults] = useState<SearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [selectedOption, setSelectedOption] = useState<Record<string, number>>({});
   const [voted, setVoted] = useState<Record<string, boolean>>({});
@@ -290,9 +317,9 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
   const startLive = async () => {
     const video = videoRef.current as (HTMLVideoElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream }) | null;
     const capture = video?.captureStream ?? video?.mozCaptureStream;
-    if (!video || !capture) { onMessage('This browser can’t capture audio from the video. Try a current Chrome or Firefox.', true); return; }
+    if (!video || !capture) { onMessage(t.msg.noCapture, true); return; }
     const stream = capture.call(video);
-    if (!stream.getAudioTracks().length) { onMessage('This recording has no audio track.', true); return; }
+    if (!stream.getAudioTracks().length) { onMessage(t.msg.noAudio, true); return; }
     const context = new AudioContext({ sampleRate: 16000 });
     const input = context.createMediaStreamSource(stream);
     const processor = context.createScriptProcessor(4096, 1, 1);
@@ -331,7 +358,7 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
         }
       } catch { /* ignore non-transcript control frames */ }
     };
-    socket.onerror = () => onMessage('Live captions couldn’t connect. The recording is still available.', true);
+    socket.onerror = () => onMessage(t.msg.captionsFailed, true);
     socket.onclose = () => { if (wsRef.current === socket) void stopLive(); };
     processor.onaudioprocess = (audio) => {
       if (!readyRef.current || socket.readyState !== WebSocket.OPEN) return;
@@ -359,13 +386,13 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     let alive = true;
     setSearching(true);
     const timer = window.setTimeout(() => {
-      api<Segment[]>('/api/search', { method: 'POST', body: JSON.stringify({ session_id: session.id, query }) })
+      api<SearchHit[]>('/api/search', { method: 'POST', body: JSON.stringify({ session_id: session.id, query, language }) })
         .then((found) => { if (alive) setResults(found); })
-        .catch((reason) => { if (alive) { setResults([]); onMessage(errorText(reason, 'Search failed.'), true); } })
+        .catch((reason) => { if (alive) { setResults([]); onMessage(errorText(reason, t.msg.searchFailed), true); } })
         .finally(() => { if (alive) setSearching(false); });
-    }, 300);
+    }, 400);
     return () => { alive = false; window.clearTimeout(timer); };
-  }, [query, session.id]);
+  }, [query, language, session.id]);
 
   const lines = useMemo(() => {
     const showInterim = interim && language === source ? interim : null;
@@ -375,10 +402,10 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     if (showInterim) list.push({ key: 'interim', start: showInterim.start, end: showInterim.end, text: showInterim.text });
     for (const outage of outages) {
       if (outage.language !== language) continue;
-      list.push({ key: `outage-${outage.language}-${outage.start}`, start: outage.start, end: outage.start, outage: true, text: `${LANGUAGES[outage.language]} translation fell behind. ${LANGUAGES[source]} captions are still saved; switch to ${source.toUpperCase()} to keep following.` });
+      list.push({ key: `outage-${outage.language}-${outage.start}`, start: outage.start, end: outage.start, outage: true, text: t.outage(t.languageNames[outage.language], t.languageNames[source], source.toUpperCase()) });
     }
     return list.sort((a, b) => a.start - b.start || Number(Boolean(a.outage)) - Number(Boolean(b.outage)));
-  }, [transcript, interim, outages, language, source]);
+  }, [transcript, interim, outages, language, source, t]);
 
   // The active line: the interim caption while live, otherwise the line at the video's playhead.
   const active = useMemo(() => {
@@ -432,8 +459,8 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
   const requestProcessing = async () => {
     try {
       await api(`/api/sessions/${session.id}/jobs`, { method: 'POST' });
-      onMessage('Recording queued for the enhanced transcript.');
-    } catch (reason) { onMessage(errorText(reason, 'Could not queue recording.'), true); }
+      onMessage(t.msg.queued);
+    } catch (reason) { onMessage(errorText(reason, t.msg.queueFailed), true); }
   };
 
   const vote = async (event: FormEvent) => {
@@ -442,16 +469,16 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     try {
       await api(`/api/polls/${primaryPoll.id}/vote`, { method: 'POST', body: JSON.stringify({ option_id: selectedOption[primaryPoll.id] }) });
       setVoted((value) => ({ ...value, [primaryPoll.id]: true }));
-      onMessage('Vote counted anonymously.');
-    } catch (reason) { onMessage(errorText(reason, 'Could not submit your vote.'), true); }
+      onMessage(t.msg.voted);
+    } catch (reason) { onMessage(errorText(reason, t.msg.voteFailed), true); }
   };
 
   const submitInterest = async (event: FormEvent) => {
     event.preventDefault();
     try {
       await api(`/api/events/${session.event_id}/interests`, { method: 'POST', body: JSON.stringify({ text: interest }) });
-      setInterest(''); onMessage('Thanks. Only topic counts are kept.');
-    } catch (reason) { onMessage(errorText(reason, 'Could not save interest.'), true); }
+      setInterest(''); onMessage(t.msg.interestSaved);
+    } catch (reason) { onMessage(errorText(reason, t.msg.interestFailed), true); }
   };
 
   const askAboutTalk = async (event: FormEvent) => {
@@ -460,42 +487,42 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     try {
       const result = await api<{ answer: string }>(`/api/sessions/${session.id}/ask`, { method: 'POST', body: JSON.stringify({ question }) });
       setAnswer(result.answer);
-    } catch (reason) { onMessage(errorText(reason, 'Session Q&A is unavailable.'), true); }
+    } catch (reason) { onMessage(errorText(reason, t.msg.qaUnavailable), true); }
     finally { setAsking(false); }
   };
 
   const timestamp = (seconds: number) => videoUrl
-    ? <button type="button" className="ts" onClick={() => seek(seconds)} aria-label={`Play from ${formatTimestamp(seconds)}`}>{formatTimestamp(seconds)}</button>
+    ? <button type="button" className="ts" onClick={() => seek(seconds)} aria-label={t.playFrom(formatTimestamp(seconds))}>{formatTimestamp(seconds)}</button>
     : <span className="ts">{formatTimestamp(seconds)}</span>;
-  const emptyText = !session.publish_content ? 'The speaker hasn’t published this session.'
-    : !session.has_recording ? 'No recording yet. Captions appear here once the speaker uploads one.'
-    : live ? `Listening… ${LANGUAGES[language]} captions will appear here.`
-    : 'Press Start captions to begin.';
+  const emptyText = !session.publish_content ? t.emptyUnpublished
+    : !session.has_recording ? t.emptyNoRecording
+    : live ? t.emptyListening(t.languageNames[language])
+    : t.emptyIdle;
   const showJump = !following && !results && (live || Boolean(active));
 
   return <main className="curator">
     <section className="session-head">
-      <p className="eyebrow">{[session.track, session.room].filter(Boolean).join(' · ') || 'Session'}</p>
+      <p className="eyebrow">{[session.track, session.room].filter(Boolean).join(' · ') || t.sessionFallback}</p>
       <h1 className="session-title">{session.title}</h1>
       <p className="session-meta">
-        <span>{session.speaker_name || 'Speaker'} · {formatTime(session.starts_at)}</span>
-        <span className="viewer-count"><span className={`dot${session.active_viewers ? ' on' : ''}`} />{session.active_viewers} watching</span>
+        <span>{session.speaker_name || t.speakerFallback} · {formatTime(t, session.starts_at)}</span>
+        <span className="viewer-count"><span className={`dot${session.active_viewers ? ' on' : ''}`} />{t.watching(formatNumber(t, session.active_viewers))}</span>
       </p>
       {sessions.length > 1 && <SessionSelect sessions={sessions} selectedId={selectedId} onChange={setSelectedId} />}
     </section>
 
     {videoUrl && <div className="video-frame">
-      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => onMessage('The recording couldn’t be played.', true)} />
+      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => onMessage(t.msg.playbackFailed, true)} />
     </div>}
 
-    <section className="live-zone" aria-label="Transcript">
+    <section className="live-zone" aria-label={t.transcriptRegion}>
       <div className="search-row">
-        <input className="search-input" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search this talk" aria-label="Search this talk" disabled={!session.publish_content} />
-        {query.length >= 2 && <span className="search-count" aria-live="polite">{searching ? 'Searching…' : `${results?.length ?? 0} ${results?.length === 1 ? 'result' : 'results'}`}</span>}
+        <input className="search-input" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t.searchPlaceholder} aria-label={t.searchLabel} disabled={!session.publish_content} />
+        {query.length >= 2 && <span className="search-count" aria-live="polite">{searching ? t.searching : t.results(results?.length ?? 0)}</span>}
       </div>
 
       {currentJob && <div className={`feed-status${currentJob.status === 'failed' ? ' is-failed' : ''}`} title={currentJob.message}>
-        <span className="dot" /><span>{JOB_LABELS[currentJob.status] ?? currentJob.status}</span>
+        <span className="dot" /><span>{jobLabel(t, currentJob.status)}</span>
         {currentJob.status !== 'completed' && <><span className="bar"><span style={{ width: `${currentJob.progress}%` }} /></span><span>{currentJob.progress}%</span></>}
       </div>}
 
@@ -503,22 +530,32 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
         <div className="feed" ref={feedRef} onScroll={onFeedScroll} onWheel={onFeedGesture} onTouchMove={onFeedGesture} aria-live={live ? 'polite' : 'off'}>
           {results
             ? results.length
-              ? results.map((result) => <div className="line" key={`r-${result.id}-${result.start_seconds}`}>{timestamp(result.start_seconds)}<p className="line-text">{highlight(result.text, query)}</p></div>)
-              : <p className="feed-empty">No matches. Try another phrase.</p>
+              ? results.map((result) => {
+                  const terms = result.match_terms?.length ? result.match_terms : query.split(/\s+/);
+                  const matchedElsewhere = result.matched_text && result.matched_language && result.matched_language !== result.language;
+                  return <div className="line" key={`r-${result.id}-${result.start_seconds}`}>
+                    {timestamp(result.start_seconds)}
+                    <div>
+                      <p className="line-text">{result.language !== language && <span className="lang-tag">{result.language.toUpperCase()}</span>}{highlight(result.text, terms)}</p>
+                      {matchedElsewhere && <p className="match-note"><span className="lang-tag">{result.matched_language?.toUpperCase()}</span>{highlight(result.matched_text ?? '', terms)}</p>}
+                    </div>
+                  </div>;
+                })
+              : <p className="feed-empty">{t.noMatches}</p>
             : lines.length
               ? lines.map((line) => <div key={line.key} className={`line${line.outage ? ' outage-line' : ''}${active && active.key === line.key ? ' active-line' : ''}`}>
                   {timestamp(line.start)}
-                  <p className="line-text">{active && active.key === line.key ? karaoke(line.text, active.on) : line.text}{line.edited && <small className="edited-note"> · edited by speaker</small>}</p>
+                  <p className="line-text">{active && active.key === line.key ? karaoke(line.text, active.on) : line.text}{line.edited && <small className="edited-note">{t.editedBySpeaker}</small>}</p>
                 </div>)
               : <p className="feed-empty">{emptyText}</p>}
         </div>
-        {showJump && <button type="button" className="jump-live" onClick={jumpToNow}>{live ? '↓ Live' : '↓ Now playing'}</button>}
+        {showJump && <button type="button" className="jump-live" onClick={jumpToNow}>{live ? t.jumpLive : t.jumpNow}</button>}
       </div>
 
       <div className="control-bar">
-        <button type="button" className="btn-primary" onClick={() => void (live ? stopLive() : startLive())} disabled={!videoUrl}>{live ? 'Stop captions' : 'Start captions'}</button>
-        <button type="button" className="btn-ghost" onClick={replay} disabled={!videoUrl || live}>Replay</button>
-        <span className="session-facts">{transcript.length} segments · {session.transcription_status.replaceAll('_', ' ')}</span>
+        <button type="button" className="btn-primary" onClick={() => void (live ? stopLive() : startLive())} disabled={!videoUrl}>{live ? t.stopCaptions : t.startCaptions}</button>
+        <button type="button" className="btn-ghost" onClick={replay} disabled={!videoUrl || live}>{t.replay}</button>
+        <span className="session-facts">{t.segments(formatNumber(t, transcript.length))} · {statusLabel(t, session.transcription_status)}</span>
       </div>
     </section>
 
@@ -526,10 +563,10 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
       {primaryPoll && <PollCard poll={primaryPoll} selectedId={selectedOption[primaryPoll.id] ?? 0} voted={voted[primaryPoll.id] ?? false} onSelect={(id) => setSelectedOption((current) => ({ ...current, [primaryPoll.id]: id }))} onSubmit={vote} />}
 
       <form className="card" onSubmit={askAboutTalk}>
-        <div className="card-head"><h2>Ask this talk</h2><span className="status plain">Optional AI</span></div>
+        <div className="card-head"><h2>{t.askTitle}</h2><span className="status plain">{t.optionalAi}</span></div>
         <div className="inline-form">
-          <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about an idea from this talk" aria-label="Your question" />
-          <button className="btn-primary btn-sm" disabled={asking || question.trim().length < 3}>{asking ? 'Looking…' : 'Ask'}</button>
+          <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={t.askPlaceholder} aria-label={t.askLabel} />
+          <button className="btn-primary btn-sm" disabled={asking || question.trim().length < 3}>{asking ? t.looking : t.ask}</button>
         </div>
         {answer && <div className="ai-answer">{answer}</div>}
       </form>
@@ -537,12 +574,12 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
       <FeedbackCard sessionId={session.id} onMessage={onMessage} />
 
       <form className="card" onSubmit={submitInterest}>
-        <h2><label htmlFor="interest">What do you want to learn here?</label></h2>
+        <h2><label htmlFor="interest">{t.interestTitle}</label></h2>
         <div className="inline-form">
-          <input id="interest" maxLength={500} value={interest} onChange={(event) => setInterest(event.target.value)} placeholder="A few topics or ideas" />
-          <button className="btn-ghost btn-sm" disabled={interest.trim().length < 2}>Add</button>
+          <input id="interest" maxLength={500} value={interest} onChange={(event) => setInterest(event.target.value)} placeholder={t.interestPlaceholder} />
+          <button className="btn-ghost btn-sm" disabled={interest.trim().length < 2}>{t.add}</button>
         </div>
-        <p className="hint">Only topic counts are kept, not your answer.</p>
+        <p className="hint">{t.interestHint}</p>
       </form>
     </section>
   </main>;
@@ -552,111 +589,119 @@ function SpeakerView({ session, sessions, selectedId, setSelectedId, transcript,
   session: Session; sessions: Session[]; selectedId: string; setSelectedId: (id: string) => void; transcript: Segment[];
   jobs: Job[]; polls: Poll[]; onMessage: Notify; onRefresh: () => Promise<void>;
 }) {
+  const t = useT();
   const [form, setForm] = useState({ title: session.title, description: session.description, speaker_name: session.speaker_name, track: session.track, room: session.room, source_language: session.source_language, publish_content: session.publish_content });
   const [uploading, setUploading] = useState(false);
+  const [fileName, setFileName] = useState('');
   const [question, setQuestion] = useState('');
   const [kind, setKind] = useState<'multiple_choice' | 'true_false'>('multiple_choice');
-  const [choices, setChoices] = useState('Choice A, Choice B');
+  const [choices, setChoices] = useState(t.defaultChoices);
   const [edits, setEdits] = useState<Record<number, string>>({});
   const [editBusy, setEditBusy] = useState<number | null>(null);
   const activeJob = jobs.find((job) => job.status === 'queued' || job.status === 'processing');
 
   const saveSession = async (event: FormEvent) => {
     event.preventDefault();
-    try { await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify(form) }); await onRefresh(); onMessage('Session details saved.'); }
-    catch (reason) { onMessage(errorText(reason, 'Could not save session.'), true); }
+    try { await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify(form) }); await onRefresh(); onMessage(t.msg.saved); }
+    catch (reason) { onMessage(errorText(reason, t.msg.saveFailed), true); }
   };
   const upload = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const input = event.currentTarget.elements.namedItem('recording') as HTMLInputElement;
     const file = input.files?.[0]; if (!file) return;
     const body = new FormData(); body.append('file', file); setUploading(true);
-    try { await api(`/api/sessions/${session.id}/media`, { method: 'POST', body }); await onRefresh(); input.value = ''; onMessage('Recording saved. Attendees can now play it.'); }
-    catch (reason) { onMessage(errorText(reason, 'Upload failed.'), true); }
+    try { await api(`/api/sessions/${session.id}/media`, { method: 'POST', body }); await onRefresh(); input.value = ''; setFileName(''); onMessage(t.msg.uploaded); }
+    catch (reason) { onMessage(errorText(reason, t.msg.uploadFailed), true); }
     finally { setUploading(false); }
   };
   const queueProcessing = async () => {
-    try { await api(`/api/sessions/${session.id}/jobs`, { method: 'POST' }); onMessage('Recording added to the processing queue.'); }
-    catch (reason) { onMessage(errorText(reason, 'Could not queue recording.'), true); }
+    try { await api(`/api/sessions/${session.id}/jobs`, { method: 'POST' }); onMessage(t.msg.processingQueued); }
+    catch (reason) { onMessage(errorText(reason, t.msg.queueFailed), true); }
   };
   const createPoll = async (event: FormEvent) => {
     event.preventDefault();
     const options = kind === 'true_false' ? [] : choices.split(',').map((item) => item.trim()).filter(Boolean);
-    try { const poll = await api<Poll>(`/api/sessions/${session.id}/polls`, { method: 'POST', body: JSON.stringify({ question, kind, options }) }); await api(`/api/polls/${poll.id}/activate`, { method: 'POST' }); setQuestion(''); onMessage('Poll is live.'); }
-    catch (reason) { onMessage(errorText(reason, 'Could not create poll.'), true); }
+    try { const poll = await api<Poll>(`/api/sessions/${session.id}/polls`, { method: 'POST', body: JSON.stringify({ question, kind, options }) }); await api(`/api/polls/${poll.id}/activate`, { method: 'POST' }); setQuestion(''); onMessage(t.msg.pollLive); }
+    catch (reason) { onMessage(errorText(reason, t.msg.pollFailed), true); }
   };
   const togglePoll = (poll: Poll) => api(`/api/polls/${poll.id}/${poll.active ? 'close' : 'activate'}`, { method: 'POST' })
-    .then(() => onMessage(poll.active ? 'Poll closed.' : 'Poll is live.'))
-    .catch((reason) => onMessage(errorText(reason, 'Could not update poll.'), true));
+    .then(() => onMessage(poll.active ? t.msg.pollClosed : t.msg.pollLive))
+    .catch((reason) => onMessage(errorText(reason, t.msg.pollUpdateFailed), true));
   const reviewEdit = async (segment: Segment) => {
     const text = edits[segment.id]?.trim(); if (!text) return;
     setEditBusy(segment.id);
-    try { const result = await api<{ approved: boolean; note: string }>(`/api/segments/${segment.id}/speaker-edit`, { method: 'POST', body: JSON.stringify({ text }) }); onMessage(result.approved ? `Edit approved: ${result.note}` : `Edit not applied: ${result.note}`, !result.approved); }
-    catch (reason) { onMessage(errorText(reason, 'AI review is unavailable.'), true); }
+    try { const result = await api<{ approved: boolean; note: string }>(`/api/segments/${segment.id}/speaker-edit`, { method: 'POST', body: JSON.stringify({ text }) }); onMessage(result.approved ? t.msg.editApproved(result.note) : t.msg.editRejected(result.note), !result.approved); }
+    catch (reason) { onMessage(errorText(reason, t.msg.reviewUnavailable), true); }
     finally { setEditBusy(null); }
   };
 
   return <main className="page">
     <section className="page-head">
-      <p className="eyebrow">Speaker</p>
+      <p className="eyebrow">{t.roles.speaker}</p>
       <h1>{session.title}</h1>
       {sessions.length > 1 && <SessionSelect sessions={sessions} selectedId={selectedId} onChange={setSelectedId} />}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Session details</h2></div>
+      <div className="card-head"><h2>{t.sessionDetails}</h2></div>
       <form className="field-grid" onSubmit={saveSession}>
-        <label className="field full-field">Title<input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
-        <label className="field full-field">Description<textarea rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
-        <label className="field">Speaker name<input value={form.speaker_name} onChange={(e) => setForm({ ...form, speaker_name: e.target.value })} /></label>
-        <label className="field">Track<input value={form.track} onChange={(e) => setForm({ ...form, track: e.target.value })} /></label>
-        <label className="field">Room<input value={form.room} onChange={(e) => setForm({ ...form, room: e.target.value })} /></label>
-        <label className="field">Talk language<select value={form.source_language} onChange={(e) => setForm({ ...form, source_language: e.target.value as Language })}>{LANGUAGE_CODES.map((code) => <option key={code} value={code}>{LANGUAGES[code]}</option>)}</select></label>
-        <label className="check-row full-field"><input type="checkbox" checked={form.publish_content} onChange={(e) => setForm({ ...form, publish_content: e.target.checked })} /><span>Publish this talk<small>Uncheck to keep the recording private. It is still kept for processing.</small></span></label>
-        <button className="btn-primary btn-sm" type="submit">Save details</button>
+        <label className="field full-field">{t.fieldTitle}<input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
+        <label className="field full-field">{t.fieldDescription}<textarea rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
+        <label className="field">{t.fieldSpeakerName}<input value={form.speaker_name} onChange={(e) => setForm({ ...form, speaker_name: e.target.value })} /></label>
+        <label className="field">{t.fieldTrack}<input value={form.track} onChange={(e) => setForm({ ...form, track: e.target.value })} /></label>
+        <label className="field">{t.fieldRoom}<input value={form.room} onChange={(e) => setForm({ ...form, room: e.target.value })} /></label>
+        <label className="field">{t.fieldTalkLanguage}<select value={form.source_language} onChange={(e) => setForm({ ...form, source_language: e.target.value as Language })}>{LANGUAGE_CODES.map((code) => <option key={code} value={code}>{t.languageNames[code]}</option>)}</select></label>
+        <label className="check-row full-field"><input type="checkbox" checked={form.publish_content} onChange={(e) => setForm({ ...form, publish_content: e.target.checked })} /><span>{t.publish}<small>{t.publishHint}</small></span></label>
+        <button className="btn-primary btn-sm" type="submit">{t.saveDetails}</button>
       </form>
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Recording</h2><span className={`status ${session.has_recording ? 'is-ready' : ''}`}>{session.has_recording ? 'Saved' : 'None yet'}</span></div>
+      <div className="card-head"><h2>{t.recording}</h2><span className={`status ${session.has_recording ? 'is-ready' : ''}`}>{session.has_recording ? t.recordingSaved : t.recordingNone}</span></div>
       <form className="upload-form" onSubmit={upload}>
-        <label htmlFor="recording-file" className="upload-drop"><strong>Choose a recording</strong><small>Video or audio, up to 1 GB</small><input id="recording-file" name="recording" type="file" accept="video/mp4,video/quicktime,video/webm,audio/*" required /></label>
-        <button className="btn-primary btn-sm" disabled={uploading}>{uploading ? 'Uploading…' : 'Upload'}</button>
+        <label htmlFor="recording-file" className="upload-drop">
+          <strong>{t.chooseRecording}</strong><small>{t.recordingHint}</small>
+          {/* The native file button ignores the page language, so it is hidden behind a translated one. */}
+          <span className="file-pick"><span className="file-button">{t.chooseFile}</span><span className="file-name">{fileName || t.noFile}</span></span>
+          <input id="recording-file" className="file-input" name="recording" type="file" accept="video/mp4,video/quicktime,video/webm,audio/*" required onChange={(e) => setFileName(e.target.files?.[0]?.name ?? '')} />
+        </label>
+        <button className="btn-primary btn-sm" disabled={uploading}>{uploading ? t.uploading : t.upload}</button>
       </form>
       {session.has_recording && <div className="row">
-        <div className="row-main"><strong>Enhanced transcript</strong><small>{activeJob ? activeJob.message : 'Transcribe, translate, and index for search.'}</small></div>
-        <button type="button" className="btn-ghost btn-sm" onClick={() => void queueProcessing()} disabled={Boolean(activeJob)}>{activeJob ? `${activeJob.progress}%` : 'Process'}</button>
+        <div className="row-main"><strong>{t.enhancedTranscript}</strong><small title={activeJob?.message}>{activeJob ? jobLabel(t, activeJob.status) : t.enhancedHint}</small></div>
+        <button type="button" className="btn-ghost btn-sm" onClick={() => void queueProcessing()} disabled={Boolean(activeJob)}>{activeJob ? `${activeJob.progress}%` : t.process}</button>
       </div>}
       {activeJob && <div className="progress"><span style={{ width: `${activeJob.progress}%` }} /></div>}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Poll</h2><span className="status plain">Anonymous</span></div>
+      <div className="card-head"><h2>{t.poll}</h2><span className="status plain">{t.anonymous}</span></div>
       <form className="field-grid" onSubmit={createPoll}>
-        <label className="field full-field">Question<input required value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="What should we explore next?" /></label>
-        <label className="field">Format<select value={kind} onChange={(e) => setKind(e.target.value as 'multiple_choice' | 'true_false')}><option value="multiple_choice">Multiple choice</option><option value="true_false">True or false</option></select></label>
-        {kind === 'multiple_choice' && <label className="field">Choices, comma separated<input value={choices} onChange={(e) => setChoices(e.target.value)} /></label>}
-        <button className="btn-primary btn-sm">Start poll</button>
+        <label className="field full-field">{t.question}<input required value={question} onChange={(e) => setQuestion(e.target.value)} placeholder={t.questionPlaceholder} /></label>
+        <label className="field">{t.format}<select value={kind} onChange={(e) => setKind(e.target.value as 'multiple_choice' | 'true_false')}><option value="multiple_choice">{t.multipleChoice}</option><option value="true_false">{t.trueFalse}</option></select></label>
+        {kind === 'multiple_choice' && <label className="field">{t.choices}<input value={choices} onChange={(e) => setChoices(e.target.value)} /></label>}
+        <button className="btn-primary btn-sm">{t.startPoll}</button>
       </form>
       {polls.length > 0 && <div className="row-list">{polls.map((poll) => <div className="row" key={poll.id}>
-        <div className="row-main"><strong>{poll.question}</strong><small>{poll.total_votes} responses</small></div>
-        <div className="row-side"><span className={`status ${poll.active ? 'is-live' : ''}`}>{poll.active ? 'Live' : 'Closed'}</span><button type="button" className="text-button" onClick={() => void togglePoll(poll)}>{poll.active ? 'Close' : 'Reopen'}</button></div>
+        <div className="row-main"><strong>{poll.question}</strong><small>{t.responses(formatNumber(t, poll.total_votes))}</small></div>
+        <div className="row-side"><span className={`status ${poll.active ? 'is-live' : ''}`}>{poll.active ? t.pollLive : t.pollClosed}</span><button type="button" className="text-button" onClick={() => void togglePoll(poll)}>{poll.active ? t.closePoll : t.reopenPoll}</button></div>
       </div>)}</div>}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Transcript corrections</h2><span className="status plain">{transcript.length} lines</span></div>
-      <p className="hint">AI reviews each correction before it’s applied.</p>
+      <div className="card-head"><h2>{t.corrections}</h2><span className="status plain">{t.lines(formatNumber(t, transcript.length))}</span></div>
+      <p className="hint">{t.correctionsHint}</p>
       {transcript.length ? <div className="row-list">{transcript.slice(0, 6).map((segment) => <div className="edit-row" key={segment.id}>
-        <p><span className="ts-tag">{formatTimestamp(segment.start_seconds)}</span>{segment.text}{segment.edited_by_speaker && <small className="edited-note"> · edited</small>}</p>
-        <label className="field">Correction<textarea rows={2} value={edits[segment.id] ?? ''} onChange={(e) => setEdits({ ...edits, [segment.id]: e.target.value })} placeholder="Rewrite this line" /></label>
-        <button type="button" className="btn-ghost btn-sm" disabled={!edits[segment.id]?.trim() || editBusy === segment.id} onClick={() => void reviewEdit(segment)}>{editBusy === segment.id ? 'Reviewing…' : 'Submit for review'}</button>
-      </div>)}</div> : <p className="subtle-empty">Transcript lines appear here after captions or processing.</p>}
+        <p><span className="ts-tag">{formatTimestamp(segment.start_seconds)}</span>{segment.text}{segment.edited_by_speaker && <small className="edited-note">{t.edited}</small>}</p>
+        <label className="field">{t.correction}<textarea rows={2} value={edits[segment.id] ?? ''} onChange={(e) => setEdits({ ...edits, [segment.id]: e.target.value })} placeholder={t.correctionPlaceholder} /></label>
+        <button type="button" className="btn-ghost btn-sm" disabled={!edits[segment.id]?.trim() || editBusy === segment.id} onClick={() => void reviewEdit(segment)}>{editBusy === segment.id ? t.reviewing : t.submitReview}</button>
+      </div>)}</div> : <p className="subtle-empty">{t.correctionsEmpty}</p>}
     </section>
   </main>;
 }
 
 function OrganizerView({ event, overview, interests, onRefresh, onMessage }: { event: ConferenceEvent; overview: Overview | null; interests: { topic: string; count: number }[]; onRefresh: () => Promise<void>; onMessage: Notify }) {
+  const t = useT();
   const [advanced, setAdvanced] = useState(false);
   const [interestSummary, setInterestSummary] = useState('');
   const [feedback, setFeedback] = useState<Record<string, { rating: number; count: number }[]>>({});
@@ -673,113 +718,140 @@ function OrganizerView({ event, overview, interests, onRefresh, onMessage }: { e
   const serviceWarning = Object.entries(overview?.services ?? {}).filter(([, status]) => ['unavailable', 'degraded'].includes(status));
   const summarize = () => api<{ summary: string }>(`/api/events/${event.id}/interest-summary`, { method: 'POST' })
     .then((result) => setInterestSummary(result.summary))
-    .catch((reason) => onMessage(errorText(reason, 'Summary is unavailable.'), true));
+    .catch((reason) => onMessage(errorText(reason, t.msg.summaryUnavailable), true));
+  const whisper = overview?.compute?.whisperlive;
 
   return <main className="page">
     <section className="page-head page-head-row">
-      <div><p className="eyebrow">Organizer</p><h1>{event.title}</h1></div>
-      <div className="head-actions"><span className="status is-live">Auto-refresh</span><button type="button" className="btn-ghost btn-sm" onClick={() => void onRefresh()}>Refresh</button></div>
+      <div><p className="eyebrow">{t.roles.organizer}</p><h1>{event.title}</h1></div>
+      <div className="head-actions"><span className="status is-live">{t.autoRefresh}</span><button type="button" className="btn-ghost btn-sm" onClick={() => void onRefresh()}>{t.refresh}</button></div>
     </section>
 
-    {serviceWarning.length > 0 && <div className="inline-alert"><strong>Service needs attention</strong><span>{serviceWarning.map(([name]) => name).join(', ')} is unavailable or degraded. Recordings stay queued for processing.</span></div>}
+    {serviceWarning.length > 0 && <div className="inline-alert"><strong>{t.serviceAttention}</strong><span>{t.serviceAttentionDetail(serviceWarning.map(([name]) => name).join(', '))}</span></div>}
 
     <section className="metric-grid">
-      <Metric label="Watching (est.)" value={overview?.counts.active_viewers ?? 0} />
-      <Metric label="Queued" value={overview?.counts.queued_jobs ?? 0} />
-      <Metric label="Processing" value={overview?.counts.processing_jobs ?? 0} />
-      <Metric label="Ready" value={overview?.counts.completed_jobs ?? 0} />
+      <Metric label={t.metricWatching} value={overview?.counts.active_viewers ?? 0} />
+      <Metric label={t.metricQueued} value={overview?.counts.queued_jobs ?? 0} />
+      <Metric label={t.metricProcessing} value={overview?.counts.processing_jobs ?? 0} />
+      <Metric label={t.metricReady} value={overview?.counts.completed_jobs ?? 0} />
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Sessions</h2><span className="status plain">{sessions.length}</span></div>
+      <div className="card-head"><h2>{t.sessions}</h2><span className="status plain">{formatNumber(t, sessions.length)}</span></div>
       {sessions.length ? <div className="row-list">{sessions.map((session) => <div className="row" key={session.id}>
-        <div className="row-main"><strong>{session.title}</strong><small>{[session.speaker_name, session.room || 'Room TBD', session.publish_content ? 'Published' : 'Opted out', `${session.interest_mentions} interest matches`, `peak ${session.max_viewers}`].filter(Boolean).join(' · ')}</small></div>
-        <div className="row-side"><span className="viewer-count"><span className={`dot${session.active_viewers ? ' on' : ''}`} />{session.active_viewers}</span><span className={`status ${statusClass(session.transcription_status)}`}>{session.transcription_status.replaceAll('_', ' ')}</span></div>
-      </div>)}</div> : <p className="hint">Loading sessions…</p>}
+        <div className="row-main"><strong>{session.title}</strong><small>{[session.speaker_name, session.room || t.roomTbd, session.publish_content ? t.published : t.optedOut, t.interestMatches(formatNumber(t, session.interest_mentions)), t.peak(formatNumber(t, session.max_viewers))].filter(Boolean).join(' · ')}</small></div>
+        <div className="row-side"><span className="viewer-count"><span className={`dot${session.active_viewers ? ' on' : ''}`} />{formatNumber(t, session.active_viewers)}</span><span className={`status ${statusClass(session.transcription_status)}`}>{statusLabel(t, session.transcription_status)}</span></div>
+      </div>)}</div> : <p className="hint">{t.loadingSessions}</p>}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Audience interests</h2><span className="status plain">Aggregate</span></div>
-      {interests.length ? <div className="topic-list">{interests.slice(0, 12).map((item) => <div className="topic-row" key={item.topic}><span>{item.topic}</span><div className="meter"><i style={{ width: `${Math.max(8, (item.count / interests[0].count) * 100)}%` }} /></div><strong>{item.count}</strong></div>)}</div> : <p className="hint">No topics yet.</p>}
-      <button type="button" className="text-button" onClick={() => void summarize()}>Summarize themes with AI</button>
+      <div className="card-head"><h2>{t.interests}</h2><span className="status plain">{t.aggregate}</span></div>
+      {interests.length ? <div className="topic-list">{interests.slice(0, 12).map((item) => <div className="topic-row" key={item.topic}><span>{item.topic}</span><div className="meter"><i style={{ width: `${Math.max(8, (item.count / interests[0].count) * 100)}%` }} /></div><strong>{formatNumber(t, item.count)}</strong></div>)}</div> : <p className="hint">{t.noTopics}</p>}
+      <button type="button" className="text-button" onClick={() => void summarize()}>{t.summarize}</button>
       {interestSummary && <div className="ai-answer">{interestSummary}</div>}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Processing queue</h2><span className="status plain">{queue.length} recent</span></div>
+      <div className="card-head"><h2>{t.queue}</h2><span className="status plain">{t.recent(formatNumber(t, queue.length))}</span></div>
       {queue.length ? <div className="row-list">{queue.map((job) => <div className="row" key={job.id}>
-        <div className="row-main"><strong>{sessions.find((item) => item.id === job.session_id)?.title ?? 'Conference session'}</strong><small>{job.message}</small></div>
+        <div className="row-main"><strong>{sessions.find((item) => item.id === job.session_id)?.title ?? t.conferenceSession}</strong><small title={job.message}>{jobLabel(t, job.status)}</small></div>
         <div className="row-side"><span>P{job.priority ?? 0}</span><span className={`status ${statusClass(job.status)}`}>{job.progress}%</span></div>
-      </div>)}</div> : <p className="hint">No recordings queued.</p>}
+      </div>)}</div> : <p className="hint">{t.noQueue}</p>}
     </section>
 
     <section className="card">
-      <div className="card-head"><h2>Ratings</h2></div>
+      <div className="card-head"><h2>{t.ratings}</h2></div>
       <div className="row-list">{sessions.map((session) => {
         const ratings = feedback[session.id] ?? [];
         const total = ratings.reduce((sum, item) => sum + item.count, 0);
-        const average = total ? (ratings.reduce((sum, item) => sum + item.rating * item.count, 0) / total).toFixed(1) : '—';
-        return <div className="row" key={session.id}><div className="row-main"><strong>{session.title}</strong><small>{total} responses</small></div><div className="row-side"><b>{average}</b><span>/ 5</span></div></div>;
+        const average = total ? (ratings.reduce((sum, item) => sum + item.rating * item.count, 0) / total).toLocaleString(t.locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '—';
+        return <div className="row" key={session.id}><div className="row-main"><strong>{session.title}</strong><small>{t.responses(formatNumber(t, total))}</small></div><div className="row-side"><b>{average}</b><span>/ 5</span></div></div>;
       })}</div>
     </section>
 
     <section className="card">
-      <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>Telemetry</h2></div></div>
-      <p className="hint">The API and worker send OpenTelemetry traces and metrics when OTLP is configured. Container and GPU charts live in Dash0.</p>
-      <p className="mono-stat">{overview?.compute ? `Backend · ${overview.compute.backend_cpu_percent.toFixed(0)}% CPU · ${overview.compute.backend_memory_mb} MB` : 'Backend telemetry set by environment'}</p>
+      <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>{t.telemetry}</h2></div></div>
+      <p className="hint">{t.telemetryHint}</p>
+      <p className="mono-stat">{overview?.compute ? t.backendStat(overview.compute.backend_cpu_percent.toFixed(0), formatNumber(t, overview.compute.backend_memory_mb)) : t.backendUnset}</p>
     </section>
 
-    <button type="button" className="text-button" onClick={() => setAdvanced(!advanced)} aria-expanded={advanced}>{advanced ? 'Hide' : 'Show'} operator details</button>
+    <button type="button" className="text-button" onClick={() => setAdvanced(!advanced)} aria-expanded={advanced}>{advanced ? t.hideDetails : t.showDetails}</button>
     {advanced && <section className="card">
-      <div className="card-head"><h2>Connected services</h2></div>
+      <div className="card-head"><h2>{t.connectedServices}</h2></div>
       <div className="row-list">{Object.entries(overview?.services ?? {}).map(([name, status]) => <div className="row" key={name}>
         <div className="row-main"><strong>{name}</strong></div>
-        <span className={`status ${statusClass(status)}`}>{status.replaceAll('_', ' ')}</span>
+        <span className={`status ${statusClass(status)}`}>{statusLabel(t, status)}</span>
       </div>)}</div>
-      <p className="mono-stat">WhisperLive clients · {overview?.compute?.whisperlive.active_clients ?? '—'} / {overview?.compute?.whisperlive.max_clients ?? '—'}</p>
+      <p className="mono-stat">{t.whisperClients(whisper?.active_clients != null ? formatNumber(t, whisper.active_clients) : '—', whisper?.max_clients != null ? formatNumber(t, whisper.max_clients) : '—')}</p>
     </section>}
   </main>;
 }
 
 function Metric({ label, value }: { label: string; value: number }) {
-  return <div className="metric"><span>{label}</span><strong>{value.toLocaleString()}</strong></div>;
+  const t = useT();
+  return <div className="metric"><span>{label}</span><strong>{formatNumber(t, value)}</strong></div>;
 }
 
 function PollCard({ poll, selectedId, voted, onSelect, onSubmit }: { poll: Poll; selectedId: number; voted: boolean; onSelect: (id: number) => void; onSubmit: (event: FormEvent) => void }) {
+  const t = useT();
   return <form className="card" onSubmit={onSubmit}>
-    <div className="card-head"><h2>{poll.question}</h2><span className="status is-live">Poll</span></div>
+    <div className="card-head"><h2>{poll.question}</h2><span className="status is-live">{t.poll}</span></div>
     <div className="poll-options">{poll.options.map((option) => <label className={`poll-option${selectedId === option.id ? ' selected' : ''}`} key={option.id}>
       <input type="radio" name={`poll-${poll.id}`} checked={selectedId === option.id} onChange={() => onSelect(option.id)} disabled={voted} />
       <span className="radio-dot" /><span>{option.label}</span>
       {voted && <strong>{poll.total_votes ? Math.round((option.votes / poll.total_votes) * 100) : 0}%</strong>}
     </label>)}</div>
     <div className="poll-bottom">
-      <p className="hint">{voted ? `${poll.total_votes} anonymous responses` : 'Anonymous. Only totals are counted.'}</p>
-      {!voted && <button className="btn-primary btn-sm" disabled={!selectedId}>Vote</button>}
+      <p className="hint">{voted ? t.pollResponses(formatNumber(t, poll.total_votes)) : t.pollAnonymous}</p>
+      {!voted && <button className="btn-primary btn-sm" disabled={!selectedId}>{t.vote}</button>}
     </div>
   </form>;
 }
 
 function FeedbackCard({ sessionId, onMessage }: { sessionId: string; onMessage: Notify }) {
+  const t = useT();
   const [rating, setRating] = useState(0);
   const [submitted, setSubmitted] = useState(false);
   const submit = async () => {
     if (!rating) return;
-    try { await api(`/api/sessions/${sessionId}/feedback`, { method: 'POST', body: JSON.stringify({ rating }) }); setSubmitted(true); onMessage('Thanks for rating this session.'); }
-    catch (reason) { onMessage(errorText(reason, 'Could not submit feedback.'), true); }
+    try { await api(`/api/sessions/${sessionId}/feedback`, { method: 'POST', body: JSON.stringify({ rating }) }); setSubmitted(true); onMessage(t.msg.rated); }
+    catch (reason) { onMessage(errorText(reason, t.msg.rateFailed), true); }
   };
   return <div className="card">
-    <h2>Rate this session</h2>
-    <div className="rating-row" role="group" aria-label="Rate the session">
-      {[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} className={`star${value <= rating ? ' on' : ''}`} onClick={() => setRating(value)} aria-label={`${value} out of 5`} aria-pressed={value === rating} disabled={submitted}>★</button>)}
-      <button type="button" className="btn-primary btn-sm" onClick={() => void submit()} disabled={!rating || submitted}>{submitted ? 'Sent' : 'Send'}</button>
+    <h2>{t.rateTitle}</h2>
+    <div className="rating-row" role="group" aria-label={t.rateGroup}>
+      {[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} className={`star${value <= rating ? ' on' : ''}`} onClick={() => setRating(value)} aria-label={t.stars(value)} aria-pressed={value === rating} disabled={submitted}>★</button>)}
+      <button type="button" className="btn-primary btn-sm" onClick={() => void submit()} disabled={!rating || submitted}>{submitted ? t.sent : t.send}</button>
     </div>
   </div>;
 }
 
-function highlight(text: string, query: string) {
-  if (!query.trim()) return text;
-  const index = text.toLowerCase().indexOf(query.toLowerCase());
-  if (index < 0) return text;
-  return <>{text.slice(0, index)}<mark>{text.slice(index, index + query.length)}</mark>{text.slice(index + query.length)}</>;
+const fold = (value: string) => value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const WORD_CHAR = /[\p{L}\p{N}_]/u;
+
+/** Marks every word that starts with one of `terms`, ignoring case and accents (the same rule the search API uses). */
+function highlight(text: string, terms: string[]) {
+  const wanted = terms.map(fold).map((term) => term.trim()).filter(Boolean);
+  if (!wanted.length) return text;
+  let folded = '';
+  const origin: number[] = []; // folded index -> index in the original text
+  for (let i = 0; i < text.length; i++) {
+    const piece = fold(text[i]);
+    for (let k = 0; k < piece.length; k++) { folded += piece[k]; origin.push(i); }
+  }
+  const marked = new Array<boolean>(text.length).fill(false);
+  for (const term of wanted) {
+    for (let at = folded.indexOf(term); at !== -1; at = folded.indexOf(term, at + 1)) {
+      if (at > 0 && WORD_CHAR.test(folded[at - 1])) continue;
+      for (let k = at; k < at + term.length; k++) marked[origin[k]] = true;
+    }
+  }
+  const parts: ReactNode[] = [];
+  for (let i = 0; i < text.length;) {
+    let j = i;
+    while (j < text.length && marked[j] === marked[i]) j++;
+    parts.push(marked[i] ? <mark key={i}>{text.slice(i, j)}</mark> : text.slice(i, j));
+    i = j;
+  }
+  return <>{parts}</>;
 }
