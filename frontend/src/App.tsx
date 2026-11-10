@@ -71,8 +71,6 @@ function reportClientEvent(name: ClientEventName, valueSeconds?: number) {
   void fetch('/api/telemetry/client-event', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
 }
 
-const LANGUAGES: Record<Language, string> = { en: 'English', es: 'Spanish', tl: 'Tagalog' };
-const LANGUAGE_CODES = Object.keys(LANGUAGES) as Language[];
 const LANGUAGE_CODES: Language[] = ['en', 'es', 'tl'];
 const ROLES: Role[] = ['attendee', 'speaker', 'organizer'];
 const THEME_KEY = 'curator-theme';
@@ -399,13 +397,11 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
         }
       } catch { /* ignore non-transcript control frames */ }
     };
-    socket.onerror = () => onMessage('Live captions couldn’t connect. The recording is still available.', true);
+    socket.onerror = () => onMessage(t.msg.captionsFailed, true);
     socket.onclose = () => {
       // wsRef still points at this socket only when the close wasn't started by stopLive.
       if (wsRef.current === socket) { reportClientEvent('websocket_disconnect'); void stopLive(); }
     };
-    socket.onerror = () => onMessage(t.msg.captionsFailed, true);
-    socket.onclose = () => { if (wsRef.current === socket) void stopLive(); };
     processor.onaudioprocess = (audio) => {
       if (!readyRef.current || socket.readyState !== WebSocket.OPEN) return;
       let samples = audio.inputBuffer.getChannelData(0);
@@ -558,8 +554,7 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     </section>
 
     {videoUrl && <div className="video-frame">
-      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => { reportClientEvent('media_playback_error'); onMessage('The recording couldn’t be played.', true); }} />
-      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => onMessage(t.msg.playbackFailed, true)} />
+      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => { reportClientEvent('media_playback_error'); onMessage(t.msg.playbackFailed, true); }} />
     </div>}
 
     <section className="live-zone" aria-label={t.transcriptRegion}>
@@ -817,9 +812,6 @@ function OrganizerView({ event, overview, interests, onRefresh, onMessage }: { e
     </section>
 
     <section className="card">
-      <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>Telemetry</h2></div></div>
-      <p className="hint">The API, worker and this web app send OpenTelemetry traces, metrics and logs to Dash0: caption delay, translation latency, processing stages and container resources.</p>
-      <p className="mono-stat">{overview?.compute ? `Backend · ${overview.compute.backend_cpu_percent.toFixed(0)}% CPU · ${overview.compute.backend_memory_mb} MB` : 'Backend telemetry set by environment'}</p>
       <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>{t.telemetry}</h2></div></div>
       <p className="hint">{t.telemetryHint}</p>
       <p className="mono-stat">{overview?.compute ? t.backendStat(overview.compute.backend_cpu_percent.toFixed(0), formatNumber(t, overview.compute.backend_memory_mb)) : t.backendUnset}</p>
