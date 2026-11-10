@@ -1,5 +1,17 @@
 # LibreTranslate, loading only the languages Curator supports (en, es, tl)
-# to keep memory and start-up time down. Models download on first start.
+# to keep memory and start-up time down. Models download on first start and
+# are kept on a PVC: on an emptyDir they count toward the cluster's default
+# 1Gi ephemeral-storage limit per container, and the pod was evicted for it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: libretranslate-models
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 3Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +20,9 @@ metadata:
     app: libretranslate
 spec:
   replicas: 1
+  # The models volume attaches to one node at a time.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: libretranslate
@@ -17,6 +32,9 @@ spec:
         app: libretranslate
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        # The image runs as uid 1032; let it write to the models volume.
+        fsGroup: 1032
       containers:
         - name: libretranslate
           image: libretranslate/libretranslate:latest
@@ -49,8 +67,8 @@ spec:
               type: RuntimeDefault
       volumes:
         - name: models
-          emptyDir:
-            sizeLimit: 3Gi
+          persistentVolumeClaim:
+            claimName: libretranslate-models
 ---
 apiVersion: v1
 kind: Service
