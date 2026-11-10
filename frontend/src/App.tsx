@@ -52,6 +52,27 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+type ClientEventName = 'session_joined' | 'transcript_delay' | 'translation_unavailable' | 'media_playback_error' | 'websocket_disconnect';
+
+function deviceCategory(): 'mobile' | 'tablet' | 'desktop' | 'unknown' {
+  try {
+    if (!window.matchMedia('(pointer: coarse)').matches) return 'desktop';
+    return Math.min(window.screen.width, window.screen.height) >= 600 ? 'tablet' : 'mobile';
+  } catch { return 'unknown'; }
+}
+
+/**
+ * Report an allowlisted operational event for Dash0. Only the event name, a coarse
+ * device category and (for delays) a number of seconds are sent: never transcript
+ * text, session content or anything identifying. Failures are ignored.
+ */
+function reportClientEvent(name: ClientEventName, valueSeconds?: number) {
+  const body = JSON.stringify({ name, device: deviceCategory(), ...(valueSeconds === undefined ? {} : { value_seconds: Math.max(0, valueSeconds) }) });
+  void fetch('/api/telemetry/client-event', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
+}
+
+const LANGUAGES: Record<Language, string> = { en: 'English', es: 'Spanish', tl: 'Tagalog' };
+const LANGUAGE_CODES = Object.keys(LANGUAGES) as Language[];
 const LANGUAGE_CODES: Language[] = ['en', 'es', 'tl'];
 const ROLES: Role[] = ['attendee', 'speaker', 'organizer'];
 const THEME_KEY = 'curator-theme';
@@ -176,6 +197,7 @@ export default function App() {
     if (!viewerToken) { viewerToken = crypto.randomUUID(); sessionStorage.setItem(key, viewerToken); }
     const ping = () => api(`/api/sessions/${selectedId}/viewers/heartbeat`, { method: 'POST', body: JSON.stringify({ viewer_token: viewerToken }) }).catch(() => {});
     ping();
+    reportClientEvent('session_joined');
     const timer = window.setInterval(ping, 25000);
     return () => { window.clearInterval(timer); void api(`/api/sessions/${selectedId}/viewers/leave`, { method: 'POST', body: JSON.stringify({ viewer_token: viewerToken }) }).catch(() => {}); };
   }, [role, selectedId]);
@@ -266,6 +288,9 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
   const streamRef = useRef<MediaStream | null>(null);
   const languageRef = useRef(language);
   const readyRef = useRef(false);
+  /** Video time when audio started streaming to WhisperLive, for measuring caption delay. */
+  const audioStartRef = useRef<number | null>(null);
+  const lastDelayEndRef = useRef(-1);
   const followRef = useRef(true);
   const [following, setFollowing] = useState(true);
   const [interim, setInterim] = useState<Interim | null>(null);
@@ -332,7 +357,11 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     socket.onmessage = (message) => {
       try {
         const data = JSON.parse(message.data as string);
-        if (data.message === 'SERVER_READY') { readyRef.current = true; setLiveState('live'); return; }
+        if (data.message === 'SERVER_READY') {
+          readyRef.current = true; setLiveState('live');
+          audioStartRef.current = videoRef.current?.currentTime ?? null; lastDelayEndRef.current = -1;
+          return;
+        }
         const segments = Array.isArray(data.segments) ? data.segments : [];
         let latest: Interim | null = null;
         let latestDone = false;
@@ -346,7 +375,19 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
           if (target !== source) {
             void api<{ translated_text: string }>(`/api/sessions/${session.id}/translate`, { method: 'POST', body: JSON.stringify({ text, target_language: target }) })
               .then((result) => saveSegment(start, end, result.translated_text, target, 'live'))
-              .catch(() => setOutages((list) => list.some((entry) => entry.language === target && Math.abs(entry.start - start) < 30) ? list : [...list, { start, language: target }]));
+              .catch(() => {
+                reportClientEvent('translation_unavailable');
+                setOutages((list) => list.some((entry) => entry.language === target && Math.abs(entry.start - start) < 30) ? list : [...list, { start, language: target }]);
+              });
+          }
+          // Caption delay: how far the video has played past the end of this finished
+          // segment. Audio offsets are relative to when streaming started.
+          const audioStart = audioStartRef.current;
+          const playing = videoRef.current;
+          if (item.completed === true && audioStart !== null && playing && end > lastDelayEndRef.current) {
+            lastDelayEndRef.current = end;
+            const delay = (playing.currentTime - audioStart) - end;
+            if (Number.isFinite(delay) && delay >= 0) reportClientEvent('transcript_delay', delay);
           }
           latest = { start, end, text, confirmed: 0 };
           latestDone = item.completed === true;
@@ -357,6 +398,11 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
           setInterim((previous) => nextInterim(previous, next, done));
         }
       } catch { /* ignore non-transcript control frames */ }
+    };
+    socket.onerror = () => onMessage('Live captions couldn’t connect. The recording is still available.', true);
+    socket.onclose = () => {
+      // wsRef still points at this socket only when the close wasn't started by stopLive.
+      if (wsRef.current === socket) { reportClientEvent('websocket_disconnect'); void stopLive(); }
     };
     socket.onerror = () => onMessage(t.msg.captionsFailed, true);
     socket.onclose = () => { if (wsRef.current === socket) void stopLive(); };
@@ -512,6 +558,7 @@ function AttendeeView({ session, sessions, selectedId, setSelectedId, language, 
     </section>
 
     {videoUrl && <div className="video-frame">
+      <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => { reportClientEvent('media_playback_error'); onMessage('The recording couldn’t be played.', true); }} />
       <video ref={videoRef} controls playsInline src={videoUrl} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onEnded={() => { void stopLive(); void requestProcessing(); }} onError={() => onMessage(t.msg.playbackFailed, true)} />
     </div>}
 
@@ -770,6 +817,9 @@ function OrganizerView({ event, overview, interests, onRefresh, onMessage }: { e
     </section>
 
     <section className="card">
+      <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>Telemetry</h2></div></div>
+      <p className="hint">The API, worker and this web app send OpenTelemetry traces, metrics and logs to Dash0: caption delay, translation latency, processing stages and container resources.</p>
+      <p className="mono-stat">{overview?.compute ? `Backend · ${overview.compute.backend_cpu_percent.toFixed(0)}% CPU · ${overview.compute.backend_memory_mb} MB` : 'Backend telemetry set by environment'}</p>
       <div className="card-head"><div><p className="eyebrow">Dash0</p><h2>{t.telemetry}</h2></div></div>
       <p className="hint">{t.telemetryHint}</p>
       <p className="mono-stat">{overview?.compute ? t.backendStat(overview.compute.backend_cpu_percent.toFixed(0), formatNumber(t, overview.compute.backend_memory_mb)) : t.backendUnset}</p>

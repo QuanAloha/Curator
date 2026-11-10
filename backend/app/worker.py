@@ -10,9 +10,11 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+from opentelemetry.trace import Status, StatusCode
 
 from . import db, observability
 
@@ -97,6 +99,40 @@ def index_segment(segment):
         pass
 
 
+@contextmanager
+def stage(name: str):
+    """A child span plus a duration sample for one processing stage."""
+    started = time.perf_counter()
+    outcome = "error"
+    with observability.tracer().start_as_current_span(f"recording.{name}") as span:
+        try:
+            yield span
+            outcome = "ok"
+        except Exception as exc:
+            span.set_status(Status(StatusCode.ERROR, exc.__class__.__name__))
+            raise
+        finally:
+            observability.processing_duration().record(
+                time.perf_counter() - started, {"processing.stage": name, "outcome": outcome}
+            )
+
+
+def timed_translation(text: str, source: str, target: str):
+    attributes = {
+        "translation.source_language": source,
+        "translation.target_language": target,
+        "translation.path": "enhanced",
+    }
+    started = time.perf_counter()
+    try:
+        translated = translate_segment(text, source, target)
+    except (httpx.HTTPError, KeyError, ValueError):
+        observability.translation_duration().record(time.perf_counter() - started, {**attributes, "outcome": "error"})
+        raise
+    observability.translation_duration().record(time.perf_counter() - started, {**attributes, "outcome": "ok"})
+    return translated
+
+
 def process(job):
     with observability.tracer().start_as_current_span("recording.enhanced_processing") as span:
         span.set_attribute("conference.session_id", job["session_id"])
@@ -106,18 +142,21 @@ def process(job):
             raise RuntimeError("The saved session recording could not be found.")
 
         update_job(job["id"], 5, "Extracting audio from the saved talk recording.")
-        wav_path = media_to_wav(session["media_path"])
+        with stage("extract_audio"):
+            wav_path = media_to_wav(session["media_path"])
         try:
             update_job(job["id"], 12, "Running the enhanced speech-to-text model.")
-            with wav_path.open("rb") as audio_file:
-                response = httpx.post(
-                    f"{WHISPERLIVE_URL}/v1/audio/transcriptions",
-                    files={"file": ("recording.wav", audio_file, "audio/wav")},
-                    data={"model": MODEL, "language": session["source_language"], "response_format": "verbose_json"},
-                    timeout=60 * 60,
-                )
-            response.raise_for_status()
-            payload = response.json()
+            with stage("transcribe") as transcribe_span:
+                transcribe_span.set_attribute("transcription.model", MODEL)
+                with wav_path.open("rb") as audio_file:
+                    response = httpx.post(
+                        f"{WHISPERLIVE_URL}/v1/audio/transcriptions",
+                        files={"file": ("recording.wav", audio_file, "audio/wav")},
+                        data={"model": MODEL, "language": session["source_language"], "response_format": "verbose_json"},
+                        timeout=60 * 60,
+                    )
+                response.raise_for_status()
+                payload = response.json()
         finally:
             wav_path.unlink(missing_ok=True)
 
@@ -126,43 +165,49 @@ def process(job):
             segments = [{"start": 0, "end": payload.get("duration", 0), "text": payload["text"]}]
         if not segments:
             raise RuntimeError("The transcription service returned no speech segments.")
+        span.set_attribute("transcription.segment_count", len(segments))
 
         update_job(job["id"], 35, "Saving timestamped transcript and preparing translations.")
         translated_segments = []
+        failed_translations = 0
         interval = max(1, len(segments) // 20)
-        for index, segment in enumerate(segments):
-            start = max(0.0, float(segment.get("start", 0)))
-            end = max(start, float(segment.get("end", start)))
-            text = str(segment.get("text", "")).strip()
-            if not text:
-                continue
-            translated_segments.append((start, end, text, session["source_language"]))
-            for target in ("en", "es", "tl"):
-                if target == session["source_language"]:
+        with stage("translate") as translate_span:
+            for index, segment in enumerate(segments):
+                start = max(0.0, float(segment.get("start", 0)))
+                end = max(start, float(segment.get("end", start)))
+                text = str(segment.get("text", "")).strip()
+                if not text:
                     continue
-                try:
-                    translated = translate_segment(text, session["source_language"], target)
-                except (httpx.HTTPError, KeyError, ValueError):
-                    continue
-                translated_segments.append((start, end, translated, target))
-            if index % interval == 0:
-                update_job(job["id"], 40 + int((index / len(segments)) * 45), f"Translating segment {index + 1} of {len(segments)}.")
+                translated_segments.append((start, end, text, session["source_language"]))
+                for target in ("en", "es", "tl"):
+                    if target == session["source_language"]:
+                        continue
+                    try:
+                        translated = timed_translation(text, session["source_language"], target)
+                    except (httpx.HTTPError, KeyError, ValueError):
+                        failed_translations += 1
+                        continue
+                    translated_segments.append((start, end, translated, target))
+                if index % interval == 0:
+                    update_job(job["id"], 40 + int((index / len(segments)) * 45), f"Translating segment {index + 1} of {len(segments)}.")
+            translate_span.set_attribute("translation.failed_count", failed_translations)
 
-        with db.connection() as conn:
-            conn.execute("DELETE FROM transcript_segments WHERE session_id = %s AND source = 'enhanced'", (job["session_id"],))
-            for start, end, text, language in translated_segments:
-                conn.execute(
-                    """INSERT INTO transcript_segments (session_id, start_seconds, end_seconds, language, text, source)
-                       VALUES (%s, %s, %s, %s, %s, 'enhanced')
-                       ON CONFLICT (session_id, start_seconds, language) DO UPDATE SET
-                         end_seconds = EXCLUDED.end_seconds, text = EXCLUDED.text, source = 'enhanced', updated_at = now()""",
-                    (job["session_id"], start, end, language, text),
-                )
+        with stage("store"):
+            with db.connection() as conn:
+                conn.execute("DELETE FROM transcript_segments WHERE session_id = %s AND source = 'enhanced'", (job["session_id"],))
+                for start, end, text, language in translated_segments:
+                    conn.execute(
+                        """INSERT INTO transcript_segments (session_id, start_seconds, end_seconds, language, text, source)
+                           VALUES (%s, %s, %s, %s, %s, 'enhanced')
+                           ON CONFLICT (session_id, start_seconds, language) DO UPDATE SET
+                             end_seconds = EXCLUDED.end_seconds, text = EXCLUDED.text, source = 'enhanced', updated_at = now()""",
+                        (job["session_id"], start, end, language, text),
+                    )
 
-        stored = db.rows("SELECT * FROM transcript_segments WHERE session_id = %s AND source = 'enhanced'", (job["session_id"],))
-        for segment in stored:
-            index_segment(segment)
-            db.update_interest_matches(segment["id"], job["session_id"], segment["text"])
+            stored = db.rows("SELECT * FROM transcript_segments WHERE session_id = %s AND source = 'enhanced'", (job["session_id"],))
+            for segment in stored:
+                index_segment(segment)
+                db.update_interest_matches(segment["id"], job["session_id"], segment["text"])
         with db.connection() as conn:
             conn.execute(
                 """UPDATE processing_jobs SET status = 'completed', progress = 100,
@@ -179,10 +224,18 @@ def main():
             if not job:
                 time.sleep(2)
                 continue
+            started = time.perf_counter()
             try:
                 process(job)
             except Exception as exc:
+                observability.processing_jobs().add(1, {"outcome": "error"})
+                observability.processing_duration().record(time.perf_counter() - started, {"processing.stage": "total", "outcome": "error"})
+                # Only the job id and error type: the message can carry tool output.
+                observability.logger.warning("Processing job %s failed (%s)", job["id"], exc.__class__.__name__)
                 fail_job(job["id"], job["session_id"], str(exc) or exc.__class__.__name__)
+            else:
+                observability.processing_jobs().add(1, {"outcome": "ok"})
+                observability.processing_duration().record(time.perf_counter() - started, {"processing.stage": "total", "outcome": "ok"})
         except Exception:
             # Leave the worker alive through transient database/network failures.
             time.sleep(3)

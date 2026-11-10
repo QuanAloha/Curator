@@ -1,0 +1,178 @@
+# OpenTelemetry Collector: the one place that talks to Dash0.
+#
+# - The API and worker send traces, metrics and logs here over OTLP/HTTP
+#   (http://otel-collector:4318), without credentials.
+# - It federates this namespace's Kubernetes container metrics from the
+#   cluster's Prometheus (monitoring/prometheus-server), because Dash0's node
+#   agent needs host access that this cluster refuses.
+# - It forwards everything to Dash0 using Secret dash0-credentials, which is
+#   created outside git (keys: endpoint, auth-token, dataset). Until that
+#   Secret exists, this pod waits in CreateContainerConfigError; the app keeps
+#   working and its telemetry export simply fails quietly.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+          grpc:
+            endpoint: 0.0.0.0:4317
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: kubernetes-team-go-utah
+              scrape_interval: 30s
+              honor_labels: true
+              metrics_path: /federate
+              params:
+                "match[]":
+                  - '{namespace="team-go-utah",__name__=~"container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_network_(receive|transmit)_bytes_total|kube_pod_container_status_restarts_total|kube_pod_container_status_ready|kube_pod_status_phase|kube_deployment_status_replicas_available|kube_deployment_spec_replicas|kube_pod_container_resource_requests|kube_pod_container_resource_limits"}'
+              static_configs:
+                - targets: ["prometheus-server.monitoring.svc:80"]
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: 200
+        spike_limit_mib: 50
+      resource:
+        attributes:
+          - key: deployment.environment.name
+            value: hackathon
+            action: upsert
+          - key: k8s.cluster.name
+            value: go-utah
+            action: upsert
+          - key: k8s.namespace.name
+            value: team-go-utah
+            action: insert
+      batch:
+        timeout: 5s
+
+    exporters:
+      otlphttp/dash0:
+        endpoint: ${env:DASH0_ENDPOINT}
+        headers:
+          Authorization: Bearer ${env:DASH0_AUTH_TOKEN}
+          Dash0-Dataset: ${env:DASH0_DATASET}
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlphttp/dash0]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlphttp/dash0]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlphttp/dash0]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            - name: DASH0_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: dash0-credentials
+                  key: endpoint
+            - name: DASH0_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dash0-credentials
+                  key: auth-token
+            - name: DASH0_DATASET
+              valueFrom:
+                secretKeyRef:
+                  name: dash0-credentials
+                  key: dataset
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: health
+              containerPort: 13133
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
